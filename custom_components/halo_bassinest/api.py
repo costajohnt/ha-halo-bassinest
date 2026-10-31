@@ -5,6 +5,7 @@ Protocol reverse-engineered from the Android app com.halosleep.smartnursery 1.0.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -19,6 +20,9 @@ _LOGGER = logging.getLogger(__name__)
 
 REST_URL = "https://sleepsure.halosleep.com:7096"
 SOCKET_URL = "https://sleepsure.halosleep.com:7098"
+TIMEOUT = aiohttp.ClientTimeout(total=15)
+RECONNECT_DELAY = 1  # seconds, doubles each failed attempt
+RECONNECT_MAX = 60
 
 # Per-control events the server pushes back as flat objects keyed by "mac".
 CONTROL_EVENTS = (
@@ -32,10 +36,9 @@ CONTROL_EVENTS = (
     "SOOTHING_PRESET",
 )
 
-# Event name -> state field prefix used in payloads.
+# Event name -> state field prefix used in payloads. MOTION and VIBRATION are
+# deliberately absent: rocking stays read-only on an infant sleeper.
 PREFIX = {
-    "MOTION": "motion",
-    "VIBRATION": "vibration",
     "SOUND": "sound",
     "NIGHT_LIGHT": "nightLight",
     "FLOOR_LIGHT": "floorLight",
@@ -55,7 +58,7 @@ def jwt_exp(token: str) -> int:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
         return int(json.loads(base64.urlsafe_b64decode(payload))["exp"])
-    except (IndexError, KeyError, ValueError):
+    except (IndexError, KeyError, TypeError, ValueError):
         return 0
 
 
@@ -77,15 +80,24 @@ class HaloClient:
         self.bassinets: dict[str, dict[str, Any]] = {}  # mac -> account Bassinest
         self.states: dict[str, dict[str, Any]] = {}  # mac -> live state
         self.connected = False
+        self.on_auth_failed: Callable[[], None] | None = None  # HA hooks reauth here
         self._listeners: list[Callable[[], None]] = []
-        self._sio = socketio.AsyncClient(reconnection=True, logger=False)
+        self._auth_error: AuthError | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._attempts = 0
+        # ponytail: reconnection=False, we own the reconnect loop below so a server
+        # kick is retried, backoff is bounded and a rejected password stops it.
+        self._sio = socketio.AsyncClient(reconnection=False, logger=False)
         self._register_handlers()
 
     async def login(self) -> str:
         async with self._session.post(
             f"{REST_URL}/api/auth/login",
             json={"email": self._email, "password": self._password},
+            timeout=TIMEOUT,
         ) as resp:
+            if resp.status not in (401, 403):
+                resp.raise_for_status()  # outage/5xx/429: retryable, not bad credentials
             body = await resp.json(content_type=None)
             if resp.status >= 400 or not body.get("accessToken"):
                 raise AuthError(body.get("message", f"HTTP {resp.status}"))
@@ -103,6 +115,7 @@ class HaloClient:
         async with self._session.get(
             f"{REST_URL}/api/user/accountInformation",
             headers={"Authorization": f"Bearer {token}"},
+            timeout=TIMEOUT,
         ) as resp:
             resp.raise_for_status()
             body = await resp.json(content_type=None)
@@ -112,13 +125,45 @@ class HaloClient:
     # socket.io
 
     async def _auth(self) -> dict[str, str]:
-        return {"token": await self._valid_token()}
+        try:
+            return {"token": await self._valid_token()}
+        except AuthError as err:
+            self._auth_error = err  # engineio wraps this in ConnectionError; see connect()
+            raise
 
     async def connect(self) -> None:
-        await self._sio.connect(SOCKET_URL, auth=self._auth, transports=["websocket"])
+        self._auth_error = None
+        try:
+            await self._sio.connect(SOCKET_URL, auth=self._auth, transports=["websocket"])
+        except socketio.exceptions.ConnectionError as err:
+            if self._auth_error:
+                raise self._auth_error from err
+            raise
 
     async def disconnect(self) -> None:
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
         await self._sio.disconnect()
+
+    async def _reconnect(self) -> None:
+        delay: float = RECONNECT_DELAY
+        while True:
+            await asyncio.sleep(delay)
+            self._attempts += 1
+            try:
+                await self.connect()
+            except AuthError as err:
+                _LOGGER.error("HALO login rejected, not retrying: %s", err)
+                if self.on_auth_failed:
+                    self.on_auth_failed()
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("HALO reconnect failed (%s), retrying in %ss", err, delay)
+                delay = min(delay * 2, RECONNECT_MAX)
+            else:
+                _LOGGER.info("HALO cloud reconnected")
+                return
 
     def add_listener(self, cb: Callable[[], None]) -> Callable[[], None]:
         self._listeners.append(cb)
@@ -126,7 +171,10 @@ class HaloClient:
 
     def _notify(self) -> None:
         for cb in list(self._listeners):
-            cb()
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("HALO state listener failed")
 
     def _register_handlers(self) -> None:
         sio = self._sio
@@ -138,24 +186,43 @@ class HaloClient:
             self._notify()
 
         @sio.event
-        async def disconnect(*_: Any) -> None:
+        async def disconnect(reason: str) -> None:
             self.connected = False
+            # Entities stay unavailable until the next snapshot: cached state is of
+            # unknown age after a drop.
+            self.states.clear()
             self._notify()
+            if reason == sio.reason.CLIENT_DISCONNECT:
+                return
+            _LOGGER.warning("HALO cloud disconnected (%s), reconnecting", reason)
+            if not self._reconnect_task or self._reconnect_task.done():
+                self._reconnect_task = asyncio.create_task(self._reconnect())
 
         @sio.on("DEVICE_SETTINGS_AND_STATES")
         async def snapshot(items: Any) -> None:
             for item in _loads(items) or []:
-                self.states[item["bassinest_id"]] = item
+                self._store(item)
+            unknown = set(self.states) - set(self.bassinets)
+            if unknown:
+                _LOGGER.warning(
+                    "Snapshot ids %s match no account MAC %s", unknown, list(self.bassinets)
+                )
             self._notify()
 
         @sio.on("DEVICE_SETTING_AND_STATE")
         async def single(item: Any) -> None:
-            item = _loads(item)
-            self.states[item["bassinest_id"]] = item
+            self._store(_loads(item))
             self._notify()
 
         for event in (*CONTROL_EVENTS, "TURN_EVERYTHING_OFF"):
             sio.on(event, self._merge)
+
+    def _store(self, item: Any) -> None:
+        mac = item.get("bassinest_id") if isinstance(item, dict) else None
+        if not mac:
+            _LOGGER.warning("Ignoring HALO push without bassinest_id: %r", item)
+            return
+        self.states.setdefault(mac, {}).update(item)
 
     async def _merge(self, data: Any) -> None:
         data = _loads(data)
@@ -170,12 +237,14 @@ class HaloClient:
         self._notify()
 
     async def _emit(self, event: str, data: dict[str, Any]) -> None:
+        if not self.connected:
+            raise ConnectionError("HALO cloud not connected")
         data = {"eventId": int(time.time() * 1000), **data}
         # The app sends the payload as a JSON *string*, not an object.
         await self._sio.emit(event, json.dumps({"action": event, "data": data}))
 
     async def set_control(self, mac: str, event: str, on: bool, **values: Any) -> None:
-        """Toggle MOTION/VIBRATION/SOUND/*_LIGHT, keeping current settings."""
+        """Toggle SOUND/*_LIGHT, keeping current settings. Motion is read-only by design."""
         p = PREFIX[event]
         state = self.states.get(mac, {})
         data: dict[str, Any] = {
@@ -191,8 +260,6 @@ class HaloClient:
         if event == "SOUND":
             data["sound"] = values.get("sound", state.get("sound") or 1)
             data["volume"] = values.get("volume", state.get("volume") or 1)
-        elif event in ("MOTION", "VIBRATION"):
-            data[p] = values.get(p, state.get(p) or 1)
         else:
             data[f"{p}Brightness"] = values.get(
                 "brightness", state.get(f"{p}Brightness") or 25
