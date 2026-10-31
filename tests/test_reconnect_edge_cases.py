@@ -169,3 +169,146 @@ def test_snapshot_request_is_retried_after_reconnect():
                 await client.disconnect()
 
     run(body)
+
+
+def test_partial_control_push_stops_snapshot_poll():
+    """_poll_snapshot loops on `not self.states`. A per-control push (phone app toggles a
+    light) during the lost-snapshot window populates states[MAC] without bassinestConnected,
+    the poll stops, and every entity stays unavailable although the socket is healthy."""
+
+    async def body():
+        async with fake_cloud() as cloud:
+            client = await connected_client(cloud)
+            try:
+                cloud.answer_snapshot = False
+                cloud.proxy.drop_all()
+                await wait_for(lambda: not client.connected)
+                await wait_for(lambda: client.connected)
+                await asyncio.sleep(0.2)
+                assert client.states == {}
+                # phone app toggles the night light: server pushes a control event
+                await cloud.sio.emit("NIGHT_LIGHT", {"mac": MAC, "nightLightState": 1})
+                await wait_for(lambda: MAC in client.states)
+                cloud.answer_snapshot = True  # server healthy again
+                await asyncio.sleep(3)
+                assert client.states[MAC].get("bassinestConnected"), (
+                    f"snapshot poll stopped on partial state: {client.states[MAC]}"
+                )
+                assert client._snapshot_task and not client._snapshot_task.done()
+            finally:
+                await client.disconnect()
+
+    run(body)
+
+
+def test_disconnect_does_not_reraise_finished_task_exception():
+    """disconnect() awaits the reconnect task; if it ended with an exception (anything
+    raised by on_auth_failed, i.e. entry.async_start_reauth), unload itself raises."""
+
+    async def body():
+        async with fake_cloud() as cloud:
+            client = await connected_client(cloud)
+
+            def boom() -> None:
+                raise RuntimeError("reauth failed")
+
+            client.on_auth_failed = boom
+            client._token = make_jwt(time.time() - 10)
+            cloud.login_status = 401
+            cloud.proxy.drop_all()
+            await wait_for(lambda: client._reconnect_task and client._reconnect_task.done())
+            await client.disconnect()  # must not raise: HA unload would fail
+
+    run(body)
+
+
+def test_disconnect_swallows_its_own_cancellation(monkeypatch):
+    """`with suppress(CancelledError): await task` also eats a cancel of the task running
+    disconnect() (HA shutdown / unload timeout): the unloader looks finished, not cancelled."""
+    monkeypatch.setattr(api, "RECONNECT_DELAY", 5)
+    monkeypatch.setattr(api, "RECONNECT_MAX", 5)
+
+    async def body():
+        async with fake_cloud() as cloud:
+            client = await connected_client(cloud)
+            cloud.proxy.drop_all()
+            await wait_for(lambda: client._reconnect_task is not None)
+            unloader = asyncio.create_task(client.disconnect())
+            await asyncio.sleep(0)  # unloader is now awaiting the sleeping reconnect task
+            assert not unloader.done(), "disconnect() finished before it could be cancelled"
+            unloader.cancel()
+            try:
+                await unloader
+            except asyncio.CancelledError:
+                return  # correct: cancellation propagated
+            raise AssertionError("disconnect() swallowed its own cancellation")
+
+    run(body)
+
+
+def test_fresh_outage_after_short_hold_pays_previous_backoff(monkeypatch):
+    """_delay must reset once the previous connection held > HOLD_RESET. After one kick
+    episode a genuine drop of a connection that held 0.6*MAX waits the full MAX."""
+    monkeypatch.setattr(api, "RECONNECT_DELAY", 0.1)
+    monkeypatch.setattr(api, "RECONNECT_MAX", 1.0)
+    monkeypatch.setattr(api, "HOLD_RESET", 0.5)
+    orig_connect = FakeCloud._connect
+    kicks = {"n": 2}  # kick the next two sessions after setup
+
+    async def kicking_connect(self, sid, environ, auth):
+        await orig_connect(self, sid, environ, auth)
+        if len(self.sids) > 1 and kicks["n"] > 0:
+            kicks["n"] -= 1
+
+            async def kick():
+                await asyncio.sleep(0.02)
+                await self.sio.disconnect(sid)
+
+            asyncio.get_running_loop().create_task(kick())
+
+    monkeypatch.setattr(FakeCloud, "_connect", kicking_connect)
+
+    async def body():
+        async with fake_cloud() as cloud:
+            client = await connected_client(cloud)
+            try:
+                await cloud.kick()
+                await wait_for(lambda: client.connected and kicks["n"] == 0, 10)
+                await asyncio.sleep(0.6)  # held 0.6 * MAX: a real connection, not a kick loop
+                t0 = time.monotonic()
+                cloud.proxy.drop_all()  # genuine network blip, server fine
+                await wait_for(lambda: not client.connected)
+                await wait_for(lambda: client.connected and MAC in client.states, 10)
+                took = time.monotonic() - t0
+                assert took < 0.5, f"fresh outage waited {took:.2f}s (previous episode's backoff)"
+            finally:
+                await client.disconnect()
+
+    run(body)
+
+
+def test_disconnect_during_snapshot_poll_is_clean():
+    async def body():
+        async with fake_cloud() as cloud:
+            client = await connected_client(cloud)
+            cloud.answer_snapshot = False
+            cloud.proxy.drop_all()
+            await wait_for(lambda: not client.connected)
+            await wait_for(lambda: client.connected)
+            poll = client._snapshot_task
+            assert poll and not poll.done()
+            await client.disconnect()
+            await asyncio.sleep(0.2)
+            assert poll.done() and client._snapshot_task is None
+            assert not client.connected and all(t.is_closing() for t in cloud.proxy.conns)
+            # re-setup on the same client clears _closed and reconnects after a drop
+            await client.connect()
+            await wait_for(lambda: client.connected)
+            assert client._closed is False
+            cloud.answer_snapshot = True
+            cloud.proxy.drop_all()
+            await wait_for(lambda: not client.connected)
+            await wait_for(lambda: client.connected and MAC in client.states, 10)
+            await client.disconnect()
+
+    run(body)

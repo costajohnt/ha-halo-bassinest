@@ -22,8 +22,9 @@ _LOGGER = logging.getLogger(__name__)
 REST_URL = "https://sleepsure.halosleep.com:7096"
 SOCKET_URL = "https://sleepsure.halosleep.com:7098"
 TIMEOUT = aiohttp.ClientTimeout(total=15)
-RECONNECT_DELAY = 1  # seconds, doubles each attempt until a connection holds RECONNECT_MAX
+RECONNECT_DELAY = 1  # seconds, doubles each attempt
 RECONNECT_MAX = 60
+HOLD_RESET = 10  # a connection that held this long resets the backoff: outage, not a kick loop
 SNAPSHOT_RETRY = 2  # seconds, doubles; re-asks for the snapshot while no state has arrived
 
 # Per-control events the server pushes back as flat objects keyed by "mac".
@@ -89,6 +90,7 @@ class HaloClient:
         self._snapshot_task: asyncio.Task[None] | None = None
         self._delay: float = RECONNECT_DELAY
         self._connected_at = 0.0
+        self._snapshot_seen = False
         self._attempts = 0
         # ponytail: reconnection=False, we own the reconnect loop below so a server
         # kick is retried, backoff is bounded and a rejected password stops it.
@@ -146,8 +148,13 @@ class HaloClient:
         for task in (self._reconnect_task, self._snapshot_task):
             if task:
                 task.cancel()
-                with suppress(asyncio.CancelledError):
+                try:
                     await task
+                except asyncio.CancelledError:
+                    if (me := asyncio.current_task()) and me.cancelling():
+                        raise  # it was us being cancelled, not the task
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("HALO background task failed")
         self._reconnect_task = self._snapshot_task = None
         await self._sio.disconnect()
 
@@ -160,8 +167,11 @@ class HaloClient:
                 await self.connect()
             except AuthError as err:
                 _LOGGER.error("HALO login rejected, not retrying: %s", err)
-                if self.on_auth_failed:
-                    self.on_auth_failed()
+                try:
+                    if self.on_auth_failed:
+                        self.on_auth_failed()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("HALO reauth callback failed")
                 return
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("HALO reconnect failed (%s), retrying in %ss", err, self._delay)
@@ -176,7 +186,7 @@ class HaloClient:
 
     async def _poll_snapshot(self) -> None:
         delay: float = SNAPSHOT_RETRY
-        while self.connected and not self.states:
+        while self.connected and not self._snapshot_seen:
             with suppress(socketio.exceptions.BadNamespaceError):
                 await self._sio.emit("DEVICE_SETTINGS_AND_STATES")
             await asyncio.sleep(delay)
@@ -209,19 +219,21 @@ class HaloClient:
             # Entities stay unavailable until the next snapshot: cached state is of
             # unknown age after a drop.
             self.states.clear()
+            self._snapshot_seen = False
             self._notify()
             if self._snapshot_task:
                 self._snapshot_task.cancel()
             if self._closed or reason == sio.reason.CLIENT_DISCONNECT:
                 return
-            if time.monotonic() - self._connected_at > RECONNECT_MAX:
-                self._delay = RECONNECT_DELAY  # it held: a fresh outage, not a kick loop
+            if time.monotonic() - self._connected_at > HOLD_RESET:
+                self._delay = RECONNECT_DELAY
             _LOGGER.warning("HALO cloud disconnected (%s), reconnecting", reason)
             if not self._reconnect_task or self._reconnect_task.done():
                 self._reconnect_task = asyncio.create_task(self._reconnect())
 
         @sio.on("DEVICE_SETTINGS_AND_STATES")
         async def snapshot(items: Any) -> None:
+            self._snapshot_seen = True
             for item in _loads(items) or []:
                 self._store(item)
             unknown = set(self.states) - set(self.bassinets)
