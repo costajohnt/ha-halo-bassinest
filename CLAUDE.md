@@ -23,7 +23,9 @@ pytest -q
 ```
 `tests/test_client.py` runs `api.py` against a local fake HALO cloud behind a TCP
 proxy (`tests/conftest.py`): error classification, state clearing on disconnect,
-reconnect after drops and server kicks, backoff, reauth stop, malformed pushes.
+reconnect after drops and server kicks, backoff, reauth stop, malformed pushes;
+`tests/test_reconnect_edge_cases.py` covers unload mid-reconnect, kick loops and
+lost snapshots.
 `.github/workflows/ci.yml` runs the same. `worktree-platforms` adds
 `tests/test_api.py` (wire format): `python tests/test_api.py`. Never point tests
 at the real cloud or a real bassinet.
