@@ -5,7 +5,7 @@ from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import AuthError, HaloClient
@@ -24,11 +24,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaloConfigEntry) -> bool
         entry.data[CONF_PASSWORD],
         entry.data[CONF_CLIENT_ID],
     )
+    client.on_auth_failed = lambda: entry.async_start_reauth(hass)
     try:
         await client.fetch_bassinets()
         await client.connect()
     except AuthError as err:
-        raise ConfigEntryError(str(err)) from err
+        raise ConfigEntryAuthFailed(str(err)) from err
     except Exception as err:
         raise ConfigEntryNotReady(str(err)) from err
 
