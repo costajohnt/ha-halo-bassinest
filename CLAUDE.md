@@ -15,13 +15,20 @@ com.halosleep.smartnursery 1.0.7, so any HALO app or server update can break it.
   `main` does not load in HA on its own. Another session holds a locked worktree
   for it at `.claude/worktrees/platforms`; don't edit it from here.
 
-## Test (from `worktree-platforms`)
+## Test
 ```
-pip install aiohttp "python-socketio[asyncio_client]>=5.11"
-python tests/test_api.py
+pip install aiohttp "python-socketio[asyncio_client]==5.17.1" pytest ruff
+ruff check custom_components tests
+pytest -q
 ```
-Runs `api.py` against a local fake HALO server (login, token expiry, socket auth,
-payload format, state merge). No CI and no linter configured.
+`tests/test_client.py` runs `api.py` against a local fake HALO cloud behind a TCP
+proxy (`tests/conftest.py`): error classification, state clearing on disconnect,
+reconnect after drops and server kicks, backoff, reauth stop, malformed pushes;
+`tests/test_reconnect_edge_cases.py` covers unload mid-reconnect, kick loops and
+lost snapshots.
+`.github/workflows/ci.yml` runs the same. `worktree-platforms` adds
+`tests/test_api.py` (wire format): `python tests/test_api.py`. Never point tests
+at the real cloud or a real bassinet.
 
 ## Install
 Copy `custom_components/halo_bassinest` into HA `config/custom_components/`,
