@@ -123,5 +123,9 @@ async def main() -> None:
     print("ok")
 
 
+def test_wire_protocol() -> None:
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
     asyncio.run(main())

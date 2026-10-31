@@ -5,13 +5,21 @@
         "title": "HALO account",
         "description": "Use the email and password from the HALO BassiNest app. A separate invited account avoids any chance of logging the phone out.",
         "data": { "email": "Email", "password": "Password" }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate HALO account",
+        "description": "The HALO cloud rejected the password for {email}. Enter the current password.",
+        "data": { "password": "Password" }
       }
     },
     "error": {
       "invalid_auth": "Login rejected by HALO.",
       "cannot_connect": "Could not reach the HALO cloud."
     },
-    "abort": { "already_configured": "This account is already configured." }
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Password updated."
+    }
   },
   "entity": {
     "binary_sensor": {
