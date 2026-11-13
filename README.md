@@ -7,7 +7,8 @@ Custom integration for the HALO BassiNest Smart Swivel Sleeper (the WiFi model t
 | Entity | Type | Notes |
 |---|---|---|
 | Online | binary_sensor | bassinet connected to the HALO cloud |
-| Rocking, Vibration | binary_sensor | read-only on purpose (see Safety) |
+| Rocking, Vibration | binary_sensor | status |
+| Soothe 2h (low) | switch | lowest rocking + vibration, the bassinet's own 2 h timer ends it (see Safety) |
 | AutoSoothe | binary_sensor | cry-response mode enabled |
 | Night light, Floor light, Back light | light | brightness snaps to 25/50/75/100 |
 | Sound | switch | on/off with the tone and volume last set in the app; tone/volume as attributes |
@@ -29,7 +30,7 @@ Tip: invite a second user to the bassinet in the HALO app and give HA that login
 
 ## Safety
 
-Rocking and vibration are not controllable from HA. An automation glitch should not be able to start motion on an infant sleeper. Lights and sound are fair game.
+The only motion control is the Soothe 2h (low) switch: lowest rocking and vibration level, with the 2 hour stop handed to the bassinet's own timer so it ends even if HA is down. There are no level or duration knobs. Don't drive it from automations. Lights and sound are fair game.
 
 ## Test
 

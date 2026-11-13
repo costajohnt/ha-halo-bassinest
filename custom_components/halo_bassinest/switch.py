@@ -18,7 +18,8 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: HaloConfigEntry, add: AddEntitiesCallback
 ) -> None:
     client = entry.runtime_data
-    add(HaloSound(client, mac, "sound") for mac in client.bassinets)
+    for mac in client.bassinets:
+        add([HaloSound(client, mac, "sound"), HaloSoothe(client, mac, "soothe_2h")])
 
 
 class HaloSound(HaloEntity, SwitchEntity):
@@ -39,3 +40,19 @@ class HaloSound(HaloEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self.client.set_control(self.mac, "SOUND", False)
+
+
+class HaloSoothe(HaloEntity, SwitchEntity):
+    """Lowest rocking + vibration for 2 h; the bassinet's own timer ends it."""
+
+    _attr_icon = "mdi:cradle"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self.state_data.get("motionState") or self.state_data.get("vibrationState"))
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self.client.soothe(self.mac, True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self.client.soothe(self.mac, False)

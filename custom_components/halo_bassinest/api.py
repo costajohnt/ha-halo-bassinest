@@ -39,9 +39,11 @@ CONTROL_EVENTS = (
     "SOOTHING_PRESET",
 )
 
-# Event name -> state field prefix used in payloads. MOTION and VIBRATION are
-# deliberately absent: rocking stays read-only on an infant sleeper.
+# Event name -> state field prefix used in payloads. MOTION and VIBRATION are only
+# reachable through soothe(): fixed lowest level, always on the bassinet's own timer.
 PREFIX = {
+    "MOTION": "motion",
+    "VIBRATION": "vibration",
     "SOUND": "sound",
     "NIGHT_LIGHT": "nightLight",
     "FLOOR_LIGHT": "floorLight",
@@ -49,6 +51,8 @@ PREFIX = {
 }
 
 DEFAULT_RUNTIME = 30  # minutes, the app's default when no timer is set
+SOOTHE_LEVEL = 1  # lowest rocking/vibration level
+SOOTHE_MINUTES = 120  # enforced by the bassinet itself, so it stops even if HA is down
 
 
 class AuthError(Exception):
@@ -278,20 +282,25 @@ class HaloClient:
         await self._sio.emit(event, json.dumps({"action": event, "data": data}))
 
     async def set_control(self, mac: str, event: str, on: bool, **values: Any) -> None:
-        """Toggle SOUND/*_LIGHT, keeping current settings. Motion is read-only by design."""
+        """Toggle SOUND/*_LIGHT keeping current settings; MOTION/VIBRATION via soothe() only."""
         p = PREFIX[event]
         state = self.states.get(mac, {})
+        motion = event in ("MOTION", "VIBRATION")
         data: dict[str, Any] = {
             "mac": mac,
             "bassinestId": self.bassinets[mac]["id"],
             "device_id": self._client_id,
             f"{p}State": int(on),
             f"previous{p[0].upper()}{p[1:]}State": int(state.get(f"{p}State", 0)),
-            f"{p}RuntimeState": int(state.get(f"{p}RuntimeState", 0)),
-            f"{p}Runtime": state.get(f"{p}Runtime") or DEFAULT_RUNTIME,
+            f"{p}RuntimeState": 1 if motion else int(state.get(f"{p}RuntimeState", 0)),
+            f"{p}Runtime": SOOTHE_MINUTES
+            if motion
+            else state.get(f"{p}Runtime") or DEFAULT_RUNTIME,
             f"previous{p[0].upper()}{p[1:]}RuntimeState": int(state.get(f"{p}RuntimeState", 0)),
         }
-        if event == "SOUND":
+        if motion:
+            data[p] = SOOTHE_LEVEL  # ponytail: hard-coded, no level/duration knob on purpose
+        elif event == "SOUND":
             data["sound"] = values.get("sound", state.get("sound") or 1)
             data["volume"] = values.get("volume", state.get("volume") or 1)
         else:
@@ -299,6 +308,11 @@ class HaloClient:
                 "brightness", state.get(f"{p}Brightness") or 25
             )
         await self._emit(event, data)
+
+    async def soothe(self, mac: str, on: bool) -> None:
+        """Lowest rocking + vibration on the bassinet's 2 h timer, or both off."""
+        for event in ("MOTION", "VIBRATION"):
+            await self.set_control(mac, event, on)
 
     async def turn_everything_off(self, mac: str) -> None:
         await self._emit("TURN_EVERYTHING_OFF", {"turnEveryThingOff": True, "mac": mac})

@@ -32,7 +32,8 @@ Copy `custom_components/halo_bassinest` into HA `config/custom_components/`,
 restart, add the integration in Settings > Devices & services.
 
 ## Hard rules
-- Rocking and vibration stay read-only. Never add HA control for motion on an
-  infant sleeper. Lights and sound are fine.
+- Motion control is limited to the "Soothe 2h (low)" switch: lowest rocking and
+  vibration level on the bassinet's own 2 h timer (owner decision 2026-11-13).
+  No level or duration knobs, never drive it from automations. Lights and sound are fine.
 - No token refresh endpoint exists; the client logs in again before JWT expiry.
 - Never commit HALO credentials or real bassinet MACs. Tests use a fake MAC.
