@@ -1,0 +1,10 @@
+{
+  "domain": "halo_bassinest",
+  "name": "HALO BassiNest",
+  "codeowners": ["@costajohnt"],
+  "config_flow": true,
+  "documentation": "https://github.com/costajohnt/ha-halo-bassinest",
+  "iot_class": "cloud_push",
+  "requirements": ["python-socketio[asyncio_client]==5.17.1"],
+  "version": "0.1.0"
+}

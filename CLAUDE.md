@@ -6,14 +6,11 @@ HALO cloud: REST login at `sleepsure.halosleep.com:7096`, socket.io state and
 control at `:7098`. Protocol reverse-engineered from the Android app
 com.halosleep.smartnursery 1.0.7, so any HALO app or server update can break it.
 
-## State of the branches
-- `main` has the client (`api.py`), setup (`__init__.py`), config flow and base
-  entity. `PLATFORMS` already lists binary_sensor, button, light and switch, but
-  those modules are not on `main` yet.
-- Branch `worktree-platforms` adds the platform modules, `manifest.json`,
-  `strings.json`, `hacs.json`, `README.md` and `tests/test_api.py`. Until it merges,
-  `main` does not load in HA on its own. Another session holds a locked worktree
-  for it at `.claude/worktrees/platforms`; don't edit it from here.
+## Layout
+- `api.py` (client), `__init__.py` (setup), `config_flow.py` (user + reauth),
+  `entity.py` (base), and the binary_sensor, button, light and switch platforms.
+  `manifest.json` pins `python-socketio[asyncio_client]==5.17.1`; `hacs.json` needs
+  HA 2024.11+ (reauth uses `_get_reauth_entry`).
 
 ## Test
 ```
@@ -26,9 +23,9 @@ proxy (`tests/conftest.py`): error classification, state clearing on disconnect,
 reconnect after drops and server kicks, backoff, reauth stop, malformed pushes;
 `tests/test_reconnect_edge_cases.py` covers unload mid-reconnect, kick loops and
 lost snapshots.
-`.github/workflows/ci.yml` runs the same. `worktree-platforms` adds
-`tests/test_api.py` (wire format): `python tests/test_api.py`. Never point tests
-at the real cloud or a real bassinet.
+`tests/test_api.py` checks the wire format (also runnable as
+`python tests/test_api.py`). `.github/workflows/ci.yml` runs the same. Never point
+tests at the real cloud or a real bassinet.
 
 ## Install
 Copy `custom_components/halo_bassinest` into HA `config/custom_components/`,
