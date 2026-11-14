@@ -23,7 +23,9 @@ Cry events are not exposed: the app only gets them as push notifications, not ov
 
 ## Install
 
-Copy `custom_components/halo_bassinest` into your HA `config/custom_components/`, restart, then Settings > Devices & services > Add integration > HALO BassiNest.
+HACS: HACS > Integrations > three-dot menu > Custom repositories, add `https://github.com/costajohnt/ha-halo-bassinest` as an Integration, install HALO BassiNest, restart HA.
+
+Manual: copy `custom_components/halo_bassinest` into your HA `config/custom_components/`, restart, then Settings > Devices & services > Add integration > HALO BassiNest.
 
 Tip: invite a second user to the bassinet in the HALO app and give HA that login, in case the backend allows only one session per user.
 
@@ -34,8 +36,12 @@ Rocking and vibration are not controllable from HA. An automation glitch should 
 ## Test
 
 ```
-pip install aiohttp "python-socketio[asyncio_client]>=5.11"
-python tests/test_api.py
+pip install aiohttp "python-socketio[asyncio_client]==5.17.1" pytest
+pytest -q
 ```
 
 Runs the client against a local fake HALO server (login, token expiry, socket auth, payload format, state merge).
+
+## License
+
+MIT. Not affiliated with or endorsed by HALO Innovations.
