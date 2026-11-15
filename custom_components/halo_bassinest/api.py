@@ -103,7 +103,6 @@ class HaloClient:
         self._delay: float = RECONNECT_DELAY
         self._connected_at = 0.0
         self._snapshot_seen = False
-        self._attempts = 0
         self._token_dropped = False  # once per outage, see _reconnect
         self._backstops: dict[str, asyncio.Task[None]] = {}
         # Serialises start, stop and the backstop per bassinet, so a stop can't land in
@@ -190,7 +189,6 @@ class HaloClient:
         while not self._closed:
             await asyncio.sleep(self._delay)
             self._delay = min(self._delay * 2, RECONNECT_MAX)
-            self._attempts += 1
             try:
                 await self.connect()
             except AuthError as err:

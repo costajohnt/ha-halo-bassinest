@@ -25,6 +25,13 @@ def make_jwt(exp: float) -> str:
     return f"{enc({'alg': 'HS256'})}.{enc({'exp': int(exp)})}.sig"
 
 
+async def until(cond, timeout: float = 5) -> None:
+    deadline = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < deadline, "timed out waiting"
+        await asyncio.sleep(0.02)
+
+
 async def main() -> None:
     logins: list[str] = []
     received: list[tuple[str, object]] = []
@@ -100,11 +107,10 @@ async def main() -> None:
 
         await client.set_control(MAC, "NIGHT_LIGHT", True, brightness=75)
         await client.set_control(MAC, "SOUND", True)
-        await asyncio.sleep(0.3)
+        await until(lambda: client.states[MAC].get("soundState") == 1)  # echo merged
         assert client.states[MAC]["nightLightState"] == 1, "echoed push not merged"
         await client.turn_everything_off(MAC)  # triggers a fresh snapshot request
-        await asyncio.sleep(0.3)
-        assert client.states[MAC]["nightLightState"] == 0, "snapshot not re-requested"
+        await until(lambda: client.states[MAC]["nightLightState"] == 0)  # snapshot re-requested
 
         events = {e: json.loads(d) for e, d in received}
         assert all(isinstance(d, str) for _, d in received), "payloads must be JSON strings"
