@@ -106,6 +106,9 @@ class HaloClient:
         self._attempts = 0
         self._token_dropped = False  # once per outage, see _reconnect
         self._backstops: dict[str, asyncio.Task[None]] = {}
+        # Serialises start, stop and the backstop per bassinet, so a stop can't land in
+        # the middle of a start or clear a deadline a newer start just set.
+        self._soothe_locks: dict[str, asyncio.Lock] = {}
         # ponytail: reconnection=False, we own the reconnect loop below so a server
         # kick is retried, backoff is bounded and a rejected password stops it.
         self._sio = socketio.AsyncClient(reconnection=False, logger=False)
@@ -156,6 +159,8 @@ class HaloClient:
         token = await self._valid_token()
         self._closed = False
         await self._sio.connect(SOCKET_URL, auth={"token": token}, transports=["websocket"])
+        if self._closed:  # unloaded while the handshake swallowed our cancel
+            return
         for mac in self.bassinets:
             if mac in _backstop_deadlines:
                 self._arm_backstop(mac)
@@ -175,6 +180,8 @@ class HaloClient:
                     except Exception:  # noqa: BLE001
                         _LOGGER.exception("HALO background task failed")
         finally:
+            for task in self._backstops.values():  # anything armed while we awaited
+                task.cancel()
             self._reconnect_task = self._snapshot_task = None
             self._backstops.clear()
             await self._sio.disconnect()
@@ -269,7 +276,8 @@ class HaloClient:
         @sio.on("DEVICE_SETTINGS_AND_STATES")
         async def snapshot(items: Any) -> None:
             parsed = _loads(items)
-            if parsed is _MALFORMED:
+            if parsed is _MALFORMED or not isinstance(parsed, list | None):
+                _LOGGER.warning("Ignoring malformed HALO snapshot")
                 return  # keep polling for a good snapshot
             self._snapshot_seen = True
             for item in parsed or []:
@@ -353,21 +361,28 @@ class HaloClient:
         Never leaves half the pair on: a failed or cancelled start sends both off. The
         HA backstop is armed before anything is sent and cleared only by a confirmed stop.
         """
-        if not on:
-            await self._stop(mac)
-            return
-        _backstop_deadlines[mac] = time.monotonic() + BACKSTOP
-        self._arm_backstop(mac)
-        try:
-            for event in ("MOTION", "VIBRATION"):
-                await self.set_control(mac, event, True)
-        except BaseException:
-            with suppress(Exception):
-                await asyncio.shield(self._stop(mac))
-            raise
+        async with self._soothe_lock(mac):
+            if not on:
+                await self._stop(mac)
+                return
+            _backstop_deadlines[mac] = time.monotonic() + BACKSTOP
+            self._arm_backstop(mac)
+            try:
+                for event in ("MOTION", "VIBRATION"):
+                    await self.set_control(mac, event, True)
+            except BaseException:
+                with suppress(Exception):
+                    await asyncio.shield(self._stop(mac))
+                raise
+
+    def _soothe_lock(self, mac: str) -> asyncio.Lock:
+        return self._soothe_locks.setdefault(mac, asyncio.Lock())
 
     async def _stop(self, mac: str) -> None:
-        """Send both off; try both even if one fails. Clears the backstop on success."""
+        """Send both off; try both even if one fails. Clears the backstop on success.
+
+        Caller holds the soothe lock.
+        """
         errors: list[Exception] = []
         for event in ("MOTION", "VIBRATION"):
             try:
@@ -391,14 +406,25 @@ class HaloClient:
             if (delay := deadline - time.monotonic()) > 0:
                 await asyncio.sleep(delay)
                 continue
-            try:
-                await self._stop(mac)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("HALO soothe backstop stop failed (%s), retrying", err)
-                await asyncio.sleep(BACKSTOP_RETRY)
-                continue
-            _LOGGER.warning("HALO soothe backstop stopped motion the bassinet timer missed")
-            return
+            async with self._soothe_lock(mac):
+                if _backstop_deadlines.get(mac, 0) > time.monotonic():
+                    continue  # restarted while we waited for the lock
+                state = self.states.get(mac)
+                if state is not None and not (
+                    state.get("motionState") or state.get("vibrationState")
+                ):
+                    # The bassinet timer did its job; nothing to stop.
+                    _backstop_deadlines.pop(mac, None)
+                    self._backstops.pop(mac, None)
+                    return
+                try:
+                    await self._stop(mac)
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning("HALO soothe backstop stop failed (%s), retrying", err)
+                else:
+                    _LOGGER.warning("HALO soothe backstop stopped motion the timer missed")
+                    return
+            await asyncio.sleep(BACKSTOP_RETRY)
 
     async def turn_everything_off(self, mac: str) -> None:
         await self._emit("TURN_EVERYTHING_OFF", {"turnEveryThingOff": True, "mac": mac})
