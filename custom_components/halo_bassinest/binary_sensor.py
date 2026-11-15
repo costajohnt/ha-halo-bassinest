@@ -13,6 +13,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import HaloConfigEntry
 from .entity import HaloEntity
 
+PARALLEL_UPDATES = 0  # pushed state, nothing to poll
+
 # key -> state field. Motion status only; the Soothe 2h switch is the sole motion control.
 SENSORS = {
     "motion": "motionState",

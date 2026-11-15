@@ -12,6 +12,8 @@ from . import HaloConfigEntry
 from .api import PREFIX
 from .entity import HaloEntity
 
+PARALLEL_UPDATES = 1  # one socket, commands go out in order
+
 LIGHTS = {"night_light": "NIGHT_LIGHT", "floor_light": "FLOOR_LIGHT", "back_light": "BACK_LIGHT"}
 
 
