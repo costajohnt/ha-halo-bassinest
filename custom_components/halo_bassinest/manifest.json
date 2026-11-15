@@ -4,8 +4,8 @@
   "codeowners": ["@costajohnt"],
   "config_flow": true,
   "documentation": "https://github.com/costajohnt/ha-halo-bassinest",
-  "issue_tracker": "https://github.com/costajohnt/ha-halo-bassinest/issues",
   "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/costajohnt/ha-halo-bassinest/issues",
   "requirements": ["python-socketio[asyncio_client]==5.17.1"],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

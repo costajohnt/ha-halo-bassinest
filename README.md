@@ -34,6 +34,29 @@ Tip: invite a second user to the bassinet in the HALO app and give HA that login
 
 The only motion control is the Soothe 2h (low) switch: lowest rocking and vibration level, with the 2 hour stop handed to the bassinet's own timer so it ends even if HA is down. There are no level or duration knobs. Don't drive it from automations. Lights and sound are fair game.
 
+## Limitations
+
+- Cloud only. If HALO's servers or the app protocol change, the integration can break without warning.
+- Bassinets are discovered at setup. Reload the integration after adding one to your HALO account.
+- Light brightness has four steps (25/50/75/100).
+- Cry events are not available (push notifications only).
+
+## Troubleshooting
+
+Turn on debug logging in `configuration.yaml`, restart, and reproduce the problem:
+
+```yaml
+logger:
+  logs:
+    custom_components.halo_bassinest: debug
+```
+
+Remove email addresses and MAC addresses before posting logs in an issue.
+
+## Removal
+
+Settings > Devices & services > HALO BassiNest > three-dot menu > Delete, then remove it in HACS (or delete `custom_components/halo_bassinest`) and restart.
+
 ## Test
 
 ```
