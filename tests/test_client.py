@@ -346,6 +346,21 @@ def test_backstop_stops_when_state_unconfirmed(monkeypatch):  # fail closed
     run(body)
 
 
+def test_backstop_stops_when_off_state_not_from_snapshot(monkeypatch):
+    monkeypatch.setattr(api, "BACKSTOP", 0.05)
+
+    async def body():
+        client, sent = _capturing_client()
+        await client.soothe(MAC, True)
+        client.states[MAC].update(motionState=0, vibrationState=0)
+        client._snapshot_seen = False  # e.g. after a reconnect, before the snapshot
+        sent.clear()
+        await wait_for(lambda: MAC not in api._backstop_deadlines)
+        assert [e for e, _ in sent] == ["MOTION", "VIBRATION"]
+
+    run(body)
+
+
 def test_backstop_survives_reload():
     async def body():
         async with fake_cloud() as cloud:
