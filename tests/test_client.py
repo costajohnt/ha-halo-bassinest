@@ -621,3 +621,34 @@ def test_motion_running_blocks_retrigger_at_any_level():  # switch guard input
     assert client.motion_running(MAC)
     client.states[MAC] = {"motionState": 0, "vibrationState": 0}
     assert not client.motion_running(MAC)
+
+
+def test_state_follows_commands_without_echo():  # live 2026-11-15: no echo to sender
+    async def body():
+        async with fake_cloud() as cloud:
+            cloud.echo = False
+            client = await connected_client(cloud)
+            try:
+                await client.set_control(MAC, "FLOOR_LIGHT", True, brightness=75)
+                await wait_for(lambda: client.states[MAC].get("floorLightState") == 1)
+                assert client.states[MAC]["floorLightBrightness"] == 75
+            finally:
+                await client.disconnect()
+
+    run(body)
+
+
+def test_periodic_refresh_sees_device_side_changes(monkeypatch):  # timer ends unpushed
+    monkeypatch.setattr(api, "STATE_REFRESH", 0.2)
+
+    async def body():
+        async with fake_cloud() as cloud:
+            client = await connected_client(cloud)
+            try:
+                assert client.states[MAC]["nightLightState"] == 1
+                cloud.snapshot_items[0]["nightLightState"] = 0  # its timer ran out
+                await wait_for(lambda: client.states[MAC]["nightLightState"] == 0)
+            finally:
+                await client.disconnect()
+
+    run(body)
