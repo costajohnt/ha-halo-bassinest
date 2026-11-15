@@ -238,18 +238,123 @@ def test_soothe_stop_tries_both_even_if_first_fails():
     assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [("VIBRATION", 0)]
 
 
-def test_failed_reconnect_drops_token():  # audit 2026-11-14 M5
+@pytest.fixture(autouse=True)
+def _clear_backstops():
+    api._backstop_deadlines.clear()
+    yield
+    api._backstop_deadlines.clear()
+
+
+def test_socket_refusal_drops_token_once_per_outage():  # audit 2026-11-14 M5
     client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
-    client._token = make_jwt(time.time() + 3600)
+    client._delay = 0
+    calls = 0
+
+    async def refused():
+        nonlocal calls
+        calls += 1
+        client._token = "fresh"  # stands in for the re-login connect() would do
+        client._closed = calls >= 2
+        raise api.socketio.exceptions.ConnectionError("token rejected")
+
+    client._token = "stale"
+    client.connect = refused  # type: ignore[method-assign]
+    asyncio.run(client._reconnect())
+    # first refusal dropped the token; the second kept the fresh one (no login storm)
+    assert calls == 2 and client._token == "fresh"
+
+
+def test_network_error_keeps_token():  # adversarial review: no relogin per outage retry
+    client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
     client._delay = 0
 
-    async def rejected():
-        client._closed = True  # one attempt only
-        raise ConnectionError("token rejected")
+    async def offline():
+        client._closed = True
+        raise aiohttp.ClientConnectionError("offline")
 
-    client.connect = rejected  # type: ignore[method-assign]
+    client._token = "kept"
+    client.connect = offline  # type: ignore[method-assign]
     asyncio.run(client._reconnect())
-    assert client._token is None
+    assert client._token == "kept"
+
+
+def test_backstop_armed_on_start_and_cleared_by_stop():
+    async def body():
+        client, sent = _capturing_client()
+        await client.soothe(MAC, True)
+        assert MAC in api._backstop_deadlines and not client._backstops[MAC].done()
+        task = client._backstops[MAC]
+        await client.soothe(MAC, False)
+        await asyncio.sleep(0)
+        assert MAC not in api._backstop_deadlines and task.cancelled()
+
+    run(body)
+
+
+def test_backstop_stops_and_retries_when_cloud_down(monkeypatch):
+    monkeypatch.setattr(api, "BACKSTOP", 0.05)
+    monkeypatch.setattr(api, "BACKSTOP_RETRY", 0.05)
+
+    async def body():
+        fail = {"off:MOTION"}
+        client, sent = _capturing_client(fail=fail)
+        await client.soothe(MAC, True)
+        await asyncio.sleep(0.12)  # deadline passed, stop failed on MOTION
+        assert MAC in api._backstop_deadlines
+        offs = [e for e, d in sent if d[f"{api.PREFIX[e]}State"] == 0]
+        assert offs[0] == "VIBRATION"  # stop still tried the other control
+        fail.clear()  # cloud back: the next retry succeeds and clears the deadline
+        await asyncio.sleep(0.12)
+        assert MAC not in api._backstop_deadlines
+        assert ("MOTION", 0) in [(e, d["motionState"]) for e, d in sent if e == "MOTION"]
+
+    run(body)
+
+
+def test_backstop_survives_reload():
+    async def body():
+        old, _ = _capturing_client()
+        await old.soothe(MAC, True)
+        await old.disconnect()  # reload: tasks stop, deadline stays
+        assert MAC in api._backstop_deadlines and not old._backstops
+        new, sent = _capturing_client()
+        api._backstop_deadlines[MAC] = 0  # overdue
+        new._arm_backstop(MAC)  # what connect() does for each known bassinet
+        await asyncio.sleep(0.01)
+        assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [
+            ("MOTION", 0),
+            ("VIBRATION", 0),
+        ]
+        assert MAC not in api._backstop_deadlines
+
+    run(body)
+
+
+def test_cancel_mid_start_rolls_back():
+    async def body():
+        client, sent = _capturing_client()
+        gate = asyncio.Event()
+        capture = client._emit
+
+        async def slow(event, data):
+            if event == "VIBRATION" and data["vibrationState"] == 1:
+                await gate.wait()  # never set: cancelled here
+            await capture(event, data)
+
+        client._emit = slow  # type: ignore[method-assign]
+        task = asyncio.create_task(client.soothe(MAC, True))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.01)
+        assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [
+            ("MOTION", 1),
+            ("MOTION", 0),
+            ("VIBRATION", 0),
+        ]
+
+    run(body)
 
 
 def test_malformed_snapshot_keeps_polling():  # audit 2026-11-14 L2
@@ -257,5 +362,8 @@ def test_malformed_snapshot_keeps_polling():  # audit 2026-11-14 L2
     handler = client._sio.handlers["/"]["DEVICE_SETTINGS_AND_STATES"]
     asyncio.run(handler("{not json"))
     assert client._snapshot_seen is False
+    asyncio.run(handler("null"))  # valid JSON, empty answer: not malformed
+    assert client._snapshot_seen is True
+    client._snapshot_seen = False
     asyncio.run(handler([]))
     assert client._snapshot_seen is True
