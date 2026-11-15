@@ -40,17 +40,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaloConfigEntry) -> bool
     client.on_auth_failed = lambda: entry.async_start_reauth(hass)
     try:
         await client.fetch_bassinets()
+        for mac in client.bassinets:  # before connect(): nothing to leak if this is cancelled
+            try:
+                await client.fetch_presets(mac)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("HALO preset list unavailable, no preset picker: %s", err)
         await client.connect()
     except AuthError as err:
         raise ConfigEntryAuthFailed(str(err)) from err
     except Exception as err:
         raise ConfigEntryNotReady(str(err)) from err
 
-    for mac in client.bassinets:
-        try:
-            await client.fetch_presets(mac)
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("HALO preset list unavailable, no preset picker: %s", err)
     reg = er.async_get(hass)
     for mac in client.bassinets:
         for key in RETIRED:

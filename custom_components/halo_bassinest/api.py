@@ -113,6 +113,8 @@ class HaloClient:
         self._token_dropped = False  # once per outage, see _reconnect
         self._backstops: dict[str, asyncio.Task[None]] = {}
         self.presets: dict[str, dict[str, str]] = {}  # mac -> preset id -> name
+        self._default_preset: dict[str, str] = {}  # mac -> preset tied to the bassinet
+        self._sent: dict[str, dict[str, Any]] = {}  # mac -> fields sent, not yet echoed
         # Serialises start, stop and the backstop per bassinet, so a stop can't land in
         # the middle of a start or clear a deadline a newer start just set.
         self._soothe_locks: dict[str, asyncio.Lock] = {}
@@ -267,6 +269,7 @@ class HaloClient:
             # Entities stay unavailable until the next snapshot: cached state is of
             # unknown age after a drop.
             self.states.clear()
+            self._sent.clear()
             self._snapshot_seen = False
             self._notify()
             if self._snapshot_task:
@@ -309,19 +312,32 @@ class HaloClient:
             _LOGGER.debug("Push without bassinest_id: %r", item)
             return
         self.states.setdefault(mac, {}).update(item)
+        self._confirmed(mac, item)
 
     async def _merge(self, data: Any) -> None:
         data = _loads(data)
         mac = data.get("mac") if isinstance(data, dict) else None
         if not mac:
             return
-        if data.get("turnEveryThingOff"):
+        # The app emits turnEveryThingOff; the server pushes turnEverythingOff.
+        if data.get("turnEverythingOff") or data.get("turnEveryThingOff"):
             # Server also pushes per-control updates; ask for a fresh snapshot to be sure.
             with suppress(socketio.exceptions.BadNamespaceError):
                 await self._sio.emit("DEVICE_SETTINGS_AND_STATES")
             return
         self.states.setdefault(mac, {}).update(data)
+        self._confirmed(mac, data)
         self._notify()
+        if "soothingPresetState" in data:
+            # A preset switches other controls server-side; re-read once it has.
+            with suppress(socketio.exceptions.BadNamespaceError):
+                await self._sio.emit("DEVICE_SETTINGS_AND_STATES")
+
+    def _confirmed(self, mac: str, item: dict[str, Any]) -> None:
+        sent = self._sent.get(mac)
+        if sent:
+            for key in item:
+                sent.pop(key, None)
 
     async def _emit(self, event: str, data: dict[str, Any]) -> None:
         if not self.connected:
@@ -351,15 +367,18 @@ class HaloClient:
         """
         p = PREFIX[event]
         cap = p[0].upper() + p[1:]
-        state = self.states.get(mac, {})
-        cur_on = int(state.get(f"{p}State", 0))
-        rs = int(state.get(f"{p}RuntimeState", 0))
-        rt = state.get(f"{p}Runtime") or DEFAULT_RUNTIME
+        state = self._current(mac)
+        motion = event in ("MOTION", "VIBRATION")
+        cur_on = int(state.get(f"{p}State") or 0)
+        cur_rs = int(state.get(f"{p}RuntimeState") or 0)
+        rs, rt = cur_rs, state.get(f"{p}Runtime") or DEFAULT_RUNTIME
         if runtime is not None:
             limit = MAX_RUNTIME.get(p, LIGHT_MAX_RUNTIME)
             if not 0 <= runtime <= limit:
                 raise ValueError(f"{p} timer must be 0-{limit} minutes")
             rs, rt = (1, runtime) if runtime else (0, DEFAULT_RUNTIME)
+        if not rs:
+            rt = DEFAULT_RUNTIME  # the app always sends its default when the timer is off
         data: dict[str, Any] = {
             "mac": mac,
             "bassinestId": self.bassinets[mac]["id"],
@@ -368,9 +387,11 @@ class HaloClient:
             f"previous{cap}State": cur_on,
             f"{p}RuntimeState": rs,
             f"{p}Runtime": rt,
-            f"previous{cap}RuntimeState": 0 if rs else 1,  # the app's own quirk
+            # The app sends the inverse of the new timer state for motion/vibration and
+            # the tracked prior value for everything else (ControlFragment getPayloadOfControl).
+            f"previous{cap}RuntimeState": (0 if rs else 1) if motion else cur_rs,
         }
-        if event in ("MOTION", "VIBRATION"):
+        if motion:
             data[p] = _check(level, LEVELS, "level") or state.get(p) or SOOTHE_LEVEL
         elif event == "SOUND":
             data["sound"] = _check(sound, TONES, "tone") or state.get("sound") or 1
@@ -381,20 +402,40 @@ class HaloClient:
                 or state.get(f"{p}Brightness")
                 or 25
             )
+        await self._send_control(event, data)
+
+    async def _send_control(self, event: str, data: dict[str, Any]) -> None:
+        """Emit, then remember what we sent until the server's echo arrives.
+
+        Without this, a second write before the echo would rebuild its "keep current"
+        fields from stale state and could undo the first (e.g. restart a stopped rocker).
+        """
         await self._emit(event, data)
+        skip = {"mac", "bassinestId", "device_id", "eventId"}
+        self._sent.setdefault(data["mac"], {}).update(
+            {k: v for k, v in data.items() if k not in skip and not k.startswith("previous")}
+        )
+
+    def _current(self, mac: str) -> dict[str, Any]:
+        """Server state with our not-yet-echoed writes on top, for "keep current" fields.
+
+        Only used to build commands. Display, the re-trigger guard and the backstop read
+        server-confirmed self.states, so a lost command can't look applied there.
+        """
+        return {**self.states.get(mac, {}), **self._sent.get(mac, {})}
 
     async def set_global_timer(self, mac: str, minutes: int) -> None:
         """Master timer for the whole bassinet; 0 turns it off."""
         if not 0 <= minutes <= MAX_RUNTIME["global"]:
             raise ValueError("master timer must be 0-120 minutes")
-        state = self.states.get(mac, {})
-        await self._emit(
+        state = self._current(mac)
+        await self._send_control(
             "GLOBAL_RUNTIME",
             {
                 "mac": mac,
                 "device_id": self._client_id,
                 "globalTimerState": 1 if minutes else 0,
-                "previousGlobalTimerState": int(state.get("globalTimerState", 0)),
+                "previousGlobalTimerState": int(state.get("globalTimerState") or 0),
                 "globalRuntimeTimer": minutes or state.get("globalRuntimeTimer") or DEFAULT_RUNTIME,
             },
         )
@@ -409,27 +450,36 @@ class HaloClient:
         preset_id: str | None = None,
     ) -> None:
         """Soothing preset on/off and choice, AutoSoothe, cry sensitivity: one event."""
-        state = self.states.get(mac, {})
-        cur_on = int(state.get("soothingPresetState", 0))
-        cur_auto = int(state.get("soothingPresetAutoModeState", 0))
-        await self._emit(
+        state = self._current(mac)
+        cur_on = int(state.get("soothingPresetState") or 0)
+        cur_auto = int(state.get("soothingPresetAutoModeState") or 0)
+        new_on = cur_on if on is None else int(on)
+        new_auto = cur_auto if auto is None else int(auto)
+        pid = str(
+            preset_id or state.get("soothingPresetId") or self._default_preset.get(mac) or ""
+        )
+        if new_on and not pid:
+            raise ValueError("choose a soothing preset first")
+        if sensitivity is not None and not new_auto:
+            raise ValueError("cry sensitivity applies to AutoSoothe; turn it on first")
+        # Side effects mirror the app: any SOOTHING_PRESET with the preset off turns the
+        # lights and master timer off; with it on, sound/rocking/vibration. The push
+        # handler re-reads the snapshot once the server has applied them.
+        await self._send_control(
             "SOOTHING_PRESET",
             {
                 "mac": mac,
                 "device_id": self._client_id,
-                "soothingPresetId": str(preset_id or state.get("soothingPresetId") or ""),
-                "soothingPresetState": cur_on if on is None else int(on),
+                "soothingPresetId": pid,
+                "soothingPresetState": new_on,
                 "previousSoothingPresetState": cur_on,
-                "soothingPresetAutoModeState": cur_auto if auto is None else int(auto),
+                "soothingPresetAutoModeState": new_auto,
                 "previousSoothingPresetAutoModeState": cur_auto,
                 "sensitivity": _check(sensitivity, SENSITIVITY, "sensitivity")
                 or state.get("sensitivity")
                 or 1,
             },
         )
-        # A preset switches other controls on/off server-side; re-read everything.
-        with suppress(socketio.exceptions.BadNamespaceError):
-            await self._sio.emit("DEVICE_SETTINGS_AND_STATES")
 
     async def fetch_presets(self, mac: str) -> dict[str, str]:
         """Preset id -> name for one bassinet (built-in and the account's own)."""
@@ -441,12 +491,17 @@ class HaloClient:
         ) as resp:
             resp.raise_for_status()
             body = await resp.json(content_type=None)
-        presets = {
-            str(p["id"]): str(p.get("soothingPresetName") or p["id"])
-            for p in body.get("allPresets") or []
-        }
-        self.presets[mac] = presets
-        return presets
+        names: dict[str, str] = {}
+        for p in body.get("allPresets") or []:
+            name = str(p.get("soothingPresetName") or p["id"])
+            if name in names.values():  # a custom preset named like a built-in one
+                name = f"{name} ({p['id']})"
+            names[str(p["id"])] = name
+        self.presets[mac] = names
+        assoc = (body.get("presetAssociatedWithMac") or {}).get("soothingPresetId")
+        if assoc:
+            self._default_preset[mac] = str(assoc)
+        return names
 
     async def soothe(self, mac: str, on: bool) -> None:
         """Lowest rocking + vibration on the bassinet's 2 h timer, or both off.

@@ -39,7 +39,7 @@
     "select": {
       "rocking_level": { "name": "Rocking level" },
       "vibration_level": { "name": "Vibration level" },
-      "tone": { "name": "Sound" },
+      "tone": { "name": "Sound tone" },
       "preset": { "name": "Preset" }
     },
     "number": {

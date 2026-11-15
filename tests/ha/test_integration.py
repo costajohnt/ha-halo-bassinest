@@ -191,11 +191,12 @@ async def test_diagnostics_when_not_loaded(hass: HomeAssistant) -> None:
     assert diag == {"entry_state": "setup_retry"}
 
 
-async def test_retired_sensors_removed(hass: HomeAssistant) -> None:
+@pytest.mark.parametrize("key", ["motion", "vibration", "autosoothe"])
+async def test_retired_sensors_removed(hass: HomeAssistant, key: str) -> None:
     entry = _entry(hass)
     reg = er.async_get(hass)
     old = reg.async_get_or_create(
-        "binary_sensor", DOMAIN, f"{MAC}_motion", config_entry=entry
+        "binary_sensor", DOMAIN, f"{MAC}_{key}", config_entry=entry
     ).entity_id
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()

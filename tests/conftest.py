@@ -112,7 +112,7 @@ class FakeCloud:
             {
                 "allPresets": [
                     {"id": 1, "soothingPresetName": "Calm"},
-                    {"id": 9, "soothingPresetName": "Mine"},
+                    {"id": 9, "soothingPresetName": "Calm"},
                 ],
                 "presetAssociatedWithMac": {"soothingPresetId": "1"},
             }
