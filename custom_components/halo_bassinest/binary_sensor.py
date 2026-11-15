@@ -1,4 +1,4 @@
-"""Read-only status: online, rocking, vibration, AutoSoothe."""
+"""Cloud connectivity per bassinet (controls live on the switch platform)."""
 
 from __future__ import annotations
 
@@ -15,29 +15,11 @@ from .entity import HaloEntity
 
 PARALLEL_UPDATES = 0  # pushed state, nothing to poll
 
-# key -> state field. Motion status only; the Soothe 2h switch is the sole motion control.
-SENSORS = {
-    "motion": "motionState",
-    "vibration": "vibrationState",
-    "autosoothe": "soothingPresetAutoModeState",
-}
-
-
 async def async_setup_entry(
     hass: HomeAssistant, entry: HaloConfigEntry, add: AddEntitiesCallback
 ) -> None:
     client = entry.runtime_data
-    entities: list[BinarySensorEntity] = []
-    for mac in client.bassinets:
-        entities.append(HaloOnline(client, mac, "online"))
-        entities += [HaloFlag(client, mac, key) for key in SENSORS]
-    add(entities)
-
-
-class HaloFlag(HaloEntity, BinarySensorEntity):
-    @property
-    def is_on(self) -> bool:
-        return bool(self.state_data.get(SENSORS[self._attr_translation_key]))
+    add(HaloOnline(client, mac, "online") for mac in client.bassinets)
 
 
 class HaloOnline(HaloEntity, BinarySensorEntity):

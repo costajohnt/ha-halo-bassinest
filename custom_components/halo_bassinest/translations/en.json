@@ -22,20 +22,36 @@
     }
   },
   "entity": {
-    "binary_sensor": {
-      "online": { "name": "Online" },
-      "motion": { "name": "Rocking" },
-      "vibration": { "name": "Vibration" },
-      "autosoothe": { "name": "AutoSoothe" }
-    },
+    "binary_sensor": { "online": { "name": "Online" } },
     "light": {
       "night_light": { "name": "Night light" },
       "floor_light": { "name": "Floor light" },
       "back_light": { "name": "Back light" }
     },
     "switch": {
+      "rocking": { "name": "Rocking" },
+      "vibration": { "name": "Vibration" },
       "sound": { "name": "Sound" },
+      "autosoothe": { "name": "AutoSoothe" },
+      "soothing_preset": { "name": "Soothing preset" },
       "soothe_2h": { "name": "Soothe 2h (low)" }
+    },
+    "select": {
+      "rocking_level": { "name": "Rocking level" },
+      "vibration_level": { "name": "Vibration level" },
+      "tone": { "name": "Sound tone" },
+      "preset": { "name": "Preset" }
+    },
+    "number": {
+      "rocking_timer": { "name": "Rocking timer" },
+      "vibration_timer": { "name": "Vibration timer" },
+      "sound_timer": { "name": "Sound timer" },
+      "night_light_timer": { "name": "Night light timer" },
+      "floor_light_timer": { "name": "Floor light timer" },
+      "back_light_timer": { "name": "Back light timer" },
+      "master_timer": { "name": "Master timer" },
+      "volume": { "name": "Volume" },
+      "sensitivity": { "name": "Cry sensitivity" }
     },
     "button": { "turn_everything_off": { "name": "Turn everything off" } }
   }

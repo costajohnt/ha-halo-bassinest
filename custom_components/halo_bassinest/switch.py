@@ -1,4 +1,4 @@
-"""Soothing sound on/off (uses the tone and volume last set in the app)."""
+"""On/off controls: rocking, vibration, sound, AutoSoothe, soothing preset, Soothe 2h."""
 
 from __future__ import annotations
 
@@ -9,51 +9,79 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import HaloConfigEntry
-from .api import SOOTHE_LEVEL
+from .api import PREFIX, SOOTHE_LEVEL
 from .entity import HaloEntity
 
 PARALLEL_UPDATES = 0  # push-only; emits are already sequential on one socket
 
-TONES = ["Brown Noise", "Pink Noise", "White Noise", "Heart Beat", "Stream"]
+CONTROLS = {"rocking": "MOTION", "vibration": "VIBRATION", "sound": "SOUND"}
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: HaloConfigEntry, add: AddEntitiesCallback
 ) -> None:
     client = entry.runtime_data
+    entities: list[SwitchEntity] = []
     for mac in client.bassinets:
-        add([HaloSound(client, mac, "sound"), HaloSoothe(client, mac, "soothe_2h")])
+        entities += [HaloControl(client, mac, key) for key in CONTROLS]
+        entities += [
+            HaloPreset(client, mac, "autosoothe"),
+            HaloPreset(client, mac, "soothing_preset"),
+            HaloSoothe(client, mac, "soothe_2h"),
+        ]
+    add(entities)
 
 
-class HaloSound(HaloEntity, SwitchEntity):
+class HaloControl(HaloEntity, SwitchEntity):
+    """Turns a control on with the level, tone, volume and timer currently set."""
+
+    @property
+    def _event(self) -> str:
+        return CONTROLS[self._attr_translation_key]
+
     @property
     def is_on(self) -> bool:
-        return bool(self.state_data.get("soundState"))
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        tone = self.state_data.get("sound") or 1
-        return {
-            "tone": TONES[tone - 1] if 1 <= tone <= 5 else tone,
-            "volume": self.state_data.get("volume"),
-        }
+        return bool(self.state_data.get(f"{PREFIX[self._event]}State"))
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self._send(self.client.set_control(self.mac, "SOUND", True))
+        await self._send(self.client.set_control(self.mac, self._event, True))
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self._send(self.client.set_control(self.mac, "SOUND", False))
+        await self._send(self.client.set_control(self.mac, self._event, False))
+
+
+class HaloPreset(HaloEntity, SwitchEntity):
+    """AutoSoothe (respond to crying) or the selected soothing preset."""
+
+    @property
+    def _field(self) -> str:
+        auto = self._attr_translation_key == "autosoothe"
+        return "soothingPresetAutoModeState" if auto else "soothingPresetState"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self.state_data.get(self._field))
+
+    async def _set(self, on: bool) -> None:
+        if self._attr_translation_key == "autosoothe":
+            await self._send(self.client.set_preset(self.mac, auto=on))
+        else:
+            await self._send(self.client.set_preset(self.mac, on=on))
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._set(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._set(False)
 
 
 class HaloSoothe(HaloEntity, SwitchEntity):
-    """Lowest rocking + vibration for 2 h; the bassinet's own timer ends it.
+    """One-tap preset: low rocking + vibration for 2 h on the bassinet's own timer.
 
-    Disabled by default: enabling it is a deliberate choice. The client also sends a
-    stop 5 minutes after the device timer should have fired (HaloClient backstop).
+    The client also sends a stop 5 minutes after the device timer should have fired.
     """
 
     _attr_icon = "mdi:cradle"
-    _attr_entity_registry_enabled_default = False
     _starting = False
 
     def _active(self, p: str) -> bool:
@@ -62,8 +90,7 @@ class HaloSoothe(HaloEntity, SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        # On only at the soothe level: rocking at a higher level from the app is not
-        # "Soothe (low)" and shows on the Rocking/Vibration sensors instead.
+        # On only at the soothe level: rocking at High shows on the Rocking switch.
         return self._active("motion") or self._active("vibration")
 
     async def async_turn_on(self, **kwargs: Any) -> None:

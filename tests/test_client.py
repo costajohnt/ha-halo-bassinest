@@ -185,8 +185,8 @@ def _capturing_client(fail: set[str] | None = None):
     # Non-default saved settings for both prefixes: soothe must override them all.
     client.states = {
         MAC: {
-            "motion": 3, "motionRuntime": 600, "motionRuntimeState": 0, "motionState": 1,
-            "vibration": 4, "vibrationRuntime": 600, "vibrationRuntimeState": 0,
+            "motion": 2, "motionRuntime": 90, "motionRuntimeState": 0, "motionState": 1,
+            "vibration": 2, "vibrationRuntime": 90, "vibrationRuntimeState": 0,
             "vibrationState": 1,
         }
     }
@@ -211,10 +211,130 @@ def test_soothe_is_lowest_level_on_device_timer():
         p = api.PREFIX[e]
         assert d[p] == 1 and d[f"{p}State"] == 1
         assert d[f"{p}Runtime"] == 120 and d[f"{p}RuntimeState"] == 1
-    # kwargs cannot raise the level
-    sent.clear()
-    asyncio.run(client.set_control(MAC, "MOTION", True, motion=5))
-    assert sent[0][1]["motion"] == 1
+
+
+def test_control_settings_payloads():
+    client, sent = _capturing_client()
+    asyncio.run(client.set_control(MAC, "MOTION", level=2, runtime=45))
+    d = sent[-1][1]
+    assert (d["motion"], d["motionRuntime"], d["motionRuntimeState"]) == (2, 45, 1)
+    assert d["motionState"] == 1 and d["previousMotionState"] == 1  # on/off untouched
+    assert d["previousMotionRuntimeState"] == 0  # the app's quirk: inverse of new state
+    asyncio.run(client.set_control(MAC, "MOTION", runtime=0))  # timer off
+    d = sent[-1][1]
+    assert (d["motionRuntimeState"], d["motionRuntime"], d["previousMotionRuntimeState"]) == (
+        0, 30, 1
+    )
+    asyncio.run(client.set_control(MAC, "SOUND", True, sound=4, volume=3, runtime=600))
+    d = sent[-1][1]
+    assert (d["sound"], d["volume"], d["soundRuntime"], d["soundState"]) == (4, 3, 600, 1)
+    assert d["previousSoundRuntimeState"] == 0  # prior value: the quirk is motion-only
+    client.states[MAC].update(nightLightRuntime=600, nightLightRuntimeState=0)
+    asyncio.run(client.set_control(MAC, "NIGHT_LIGHT", True))
+    assert sent[-1][1]["nightLightRuntime"] == 30  # timer off: the app's default
+    asyncio.run(client.set_control(MAC, "BACK_LIGHT", brightness=50, runtime=600))
+    assert sent[-1][1]["backLightBrightness"] == 50
+
+
+@pytest.mark.parametrize(
+    ("event", "kwargs"),
+    [
+        ("MOTION", {"level": 3}),
+        ("VIBRATION", {"runtime": 121}),
+        ("SOUND", {"volume": 4}),
+        ("SOUND", {"sound": 6}),
+        ("SOUND", {"runtime": 601}),
+        ("NIGHT_LIGHT", {"brightness": 60}),
+        ("MOTION", {"runtime": -1}),
+    ],
+)
+def test_control_values_outside_app_range_are_refused(event, kwargs):
+    client, sent = _capturing_client()
+    with pytest.raises(ValueError):
+        asyncio.run(client.set_control(MAC, event, **kwargs))
+    assert sent == []
+
+
+def test_global_timer_and_preset_payloads():
+    client, sent = _capturing_client()
+    client.states[MAC].update(soothingPresetId="12", sensitivity=3)
+    asyncio.run(client.set_global_timer(MAC, 60))
+    e, d = sent[-1]
+    assert e == "GLOBAL_RUNTIME" and (d["globalTimerState"], d["globalRuntimeTimer"]) == (1, 60)
+    assert "bassinestId" not in d
+    asyncio.run(client.set_preset(MAC, auto=True))
+    e, d = sent[-1]
+    assert e == "SOOTHING_PRESET" and "bassinestId" not in d
+    assert (d["soothingPresetAutoModeState"], d["previousSoothingPresetAutoModeState"]) == (1, 0)
+    assert d["soothingPresetId"] == "12" and d["sensitivity"] == 3  # current kept
+    asyncio.run(client.set_preset(MAC, preset_id="7", on=True, sensitivity=4))
+    d = sent[-1][1]
+    assert (d["soothingPresetId"], d["soothingPresetState"], d["sensitivity"]) == ("7", 1, 4)
+    with pytest.raises(ValueError):
+        asyncio.run(client.set_preset(MAC, sensitivity=5))
+    with pytest.raises(ValueError):
+        asyncio.run(client.set_global_timer(MAC, 121))
+
+
+def test_fetch_presets_and_default():
+    async def body():
+        async with fake_cloud() as cloud:
+            client = api.HaloClient(cloud.session, "a@b.c", "pw", "ha-test")
+            # a custom preset named like a built-in one stays selectable
+            assert await client.fetch_presets(MAC) == {"1": "Calm", "9": "Calm (9)"}
+            client.bassinets = {MAC: {"id": 7}}
+            sent: list[dict] = []
+
+            async def capture(event, data):
+                sent.append(data)
+
+            client._emit = capture  # type: ignore[method-assign]
+            await client.set_preset(MAC, on=True)  # no id in state: bassinet's own preset
+            assert sent[-1]["soothingPresetId"] == "1"
+
+    run(body)
+
+
+def test_preset_guards():
+    client, sent = _capturing_client()
+    with pytest.raises(ValueError):  # nothing chosen and no default known
+        asyncio.run(client.set_preset(MAC, on=True))
+    with pytest.raises(ValueError):  # the app only allows this while AutoSoothe is on
+        asyncio.run(client.set_preset(MAC, sensitivity=2))
+    assert sent == []
+
+
+def test_second_write_before_echo_keeps_first():  # review: stale "keep current"
+    client, sent = _capturing_client()  # server state: rocking on
+    asyncio.run(client.set_control(MAC, "MOTION", False))
+    asyncio.run(client.set_control(MAC, "MOTION", level=1))  # before the echo
+    assert sent[-1][1]["motionState"] == 0  # does not restart rocking
+    assert client.states[MAC]["motionState"] == 1  # display waits for the server
+    assert client.motion_running(MAC)  # the guard also reads server-confirmed state
+    asyncio.run(client._merge({"mac": MAC, "motionState": 0}))  # echo
+    assert "motionState" not in client._sent[MAC]
+
+
+def test_null_fields_do_not_break_commands():
+    client, sent = _capturing_client()
+    client.states[MAC].update(motionRuntimeState=None, soothingPresetAutoModeState=None)
+    asyncio.run(client.soothe(MAC, False))
+    asyncio.run(client.set_global_timer(MAC, 0))
+    assert len(sent) == 3
+
+
+def test_pushes_that_change_other_controls_refresh_snapshot():
+    client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
+    asked: list[str] = []
+
+    async def emit(event, *args, **kwargs):
+        asked.append(event)
+
+    client._sio.emit = emit  # type: ignore[method-assign]
+    asyncio.run(client._merge({"mac": MAC, "turnEverythingOff": 1}))  # server spelling
+    asyncio.run(client._merge({"mac": MAC, "soothingPresetState": 1}))
+    asyncio.run(client._merge({"mac": MAC, "nightLightState": 1}))
+    assert asked == ["DEVICE_SETTINGS_AND_STATES", "DEVICE_SETTINGS_AND_STATES"]
 
 
 def test_soothe_off_sends_both_off():
@@ -495,7 +615,7 @@ def test_malformed_snapshot_keeps_polling():  # audit 2026-11-14 L2
 
 def test_motion_running_blocks_retrigger_at_any_level():  # switch guard input
     client, _ = _capturing_client()
-    client.states[MAC] = {"motionState": 1, "motion": 3}  # app rocking at level 3
+    client.states[MAC] = {"motionState": 1, "motion": 2}  # rocking on High
     assert client.motion_running(MAC)
     client.states[MAC] = {"vibrationState": 1}  # half on
     assert client.motion_running(MAC)
