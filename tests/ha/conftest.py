@@ -44,8 +44,8 @@ class FakeClient(api.HaloClient):
         self.bassinets = {MAC: {"id": 7, "mac": MAC, **FakeClient.bassinet}}
         return self.bassinets
 
-    async def fetch_presets(self, mac: str) -> dict[str, str]:
-        self.presets[mac] = {"1": "Calm", "9": "Mine"}
+    async def fetch_presets(self, mac: str) -> list[str]:
+        self.presets[mac] = ["0-3 weeks", "newborn"]
         return self.presets[mac]
 
     async def connect(self) -> None:

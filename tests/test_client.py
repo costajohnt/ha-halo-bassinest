@@ -257,7 +257,7 @@ def test_control_values_outside_app_range_are_refused(event, kwargs):
 
 def test_global_timer_and_preset_payloads():
     client, sent = _capturing_client()
-    client.states[MAC].update(soothingPresetId="12", sensitivity=3)
+    client.states[MAC].update(soothingPresetId="0-3 weeks", sensitivity=3)
     asyncio.run(client.set_global_timer(MAC, 60))
     e, d = sent[-1]
     assert e == "GLOBAL_RUNTIME" and (d["globalTimerState"], d["globalRuntimeTimer"]) == (1, 60)
@@ -266,10 +266,10 @@ def test_global_timer_and_preset_payloads():
     e, d = sent[-1]
     assert e == "SOOTHING_PRESET" and "bassinestId" not in d
     assert (d["soothingPresetAutoModeState"], d["previousSoothingPresetAutoModeState"]) == (1, 0)
-    assert d["soothingPresetId"] == "12" and d["sensitivity"] == 3  # current kept
-    asyncio.run(client.set_preset(MAC, preset_id="7", on=True, sensitivity=4))
+    assert d["soothingPresetId"] == "0-3 weeks" and d["sensitivity"] == 3  # current kept
+    asyncio.run(client.set_preset(MAC, preset_id="newborn", on=True, sensitivity=4))
     d = sent[-1][1]
-    assert (d["soothingPresetId"], d["soothingPresetState"], d["sensitivity"]) == ("7", 1, 4)
+    assert (d["soothingPresetId"], d["soothingPresetState"], d["sensitivity"]) == ("newborn", 1, 4)
     with pytest.raises(ValueError):
         asyncio.run(client.set_preset(MAC, sensitivity=5))
     with pytest.raises(ValueError):
@@ -280,8 +280,8 @@ def test_fetch_presets_and_default():
     async def body():
         async with fake_cloud() as cloud:
             client = api.HaloClient(cloud.session, "a@b.c", "pw", "ha-test")
-            # a custom preset named like a built-in one stays selectable
-            assert await client.fetch_presets(MAC) == {"1": "Calm", "9": "Calm (9)"}
+            # names, de-duplicated: the cloud identifies presets by name
+            assert await client.fetch_presets(MAC) == ["0-3 weeks", "newborn"]
             client.bassinets = {MAC: {"id": 7}}
             sent: list[dict] = []
 
@@ -290,7 +290,7 @@ def test_fetch_presets_and_default():
 
             client._emit = capture  # type: ignore[method-assign]
             await client.set_preset(MAC, on=True)  # no id in state: bassinet's own preset
-            assert sent[-1]["soothingPresetId"] == "1"
+            assert sent[-1]["soothingPresetId"] == "0-3 weeks"
 
     run(body)
 

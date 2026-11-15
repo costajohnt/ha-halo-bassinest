@@ -117,7 +117,9 @@ class HaloClient:
         self._snapshot_seen = False
         self._token_dropped = False  # once per outage, see _reconnect
         self._backstops: dict[str, asyncio.Task[None]] = {}
-        self.presets: dict[str, dict[str, str]] = {}  # mac -> preset id -> name
+        # mac -> preset names. The cloud identifies presets by name: soothingPresetId in
+        # state and in SOOTHING_PRESET is the name (seen live 2026-11-15), not the REST id.
+        self.presets: dict[str, list[str]] = {}
         self._default_preset: dict[str, str] = {}  # mac -> preset tied to the bassinet
         self._sent: dict[str, dict[str, Any]] = {}  # mac -> fields sent, not yet echoed
         self._refresh_now = asyncio.Event()
@@ -508,8 +510,8 @@ class HaloClient:
             },
         )
 
-    async def fetch_presets(self, mac: str) -> dict[str, str]:
-        """Preset id -> name for one bassinet (built-in and the account's own)."""
+    async def fetch_presets(self, mac: str) -> list[str]:
+        """Preset names for one bassinet (built-in and the account's own)."""
         token = await self._valid_token()
         async with self._session.get(
             f"{REST_URL}/api/soothingPresetInfo/{mac}",
@@ -518,12 +520,13 @@ class HaloClient:
         ) as resp:
             resp.raise_for_status()
             body = await resp.json(content_type=None)
-        names: dict[str, str] = {}
-        for p in body.get("allPresets") or []:
-            name = str(p.get("soothingPresetName") or p["id"])
-            if name in names.values():  # a custom preset named like a built-in one
-                name = f"{name} ({p['id']})"
-            names[str(p["id"])] = name
+        names = list(
+            dict.fromkeys(  # same-named presets are one preset to the cloud
+                str(p["soothingPresetName"])
+                for p in body.get("allPresets") or []
+                if p.get("soothingPresetName")
+            )
+        )
         self.presets[mac] = names
         assoc = (body.get("presetAssociatedWithMac") or {}).get("soothingPresetId")
         if assoc:

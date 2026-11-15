@@ -112,10 +112,11 @@ class FakeCloud:
         return web.json_response(
             {
                 "allPresets": [
-                    {"id": 1, "soothingPresetName": "Calm"},
-                    {"id": 9, "soothingPresetName": "Calm"},
+                    {"id": 1, "soothingPresetName": "0-3 weeks"},
+                    {"id": 2, "soothingPresetName": "newborn"},
+                    {"id": 9, "soothingPresetName": "newborn"},
                 ],
-                "presetAssociatedWithMac": {"soothingPresetId": "1"},
+                "presetAssociatedWithMac": {"soothingPresetId": "0-3 weeks"},
             }
         )
 
