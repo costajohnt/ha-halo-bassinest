@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 import pytest
 from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, EntityCategory
@@ -11,12 +14,11 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.halo_bassinest import CONF_CLIENT_ID, DOMAIN
+from custom_components.halo_bassinest import CONF_CLIENT_ID, DOMAIN, api
 from custom_components.halo_bassinest.api import AuthError
 from custom_components.halo_bassinest.diagnostics import async_get_config_entry_diagnostics
-from custom_components.halo_bassinest.switch import HaloSoothe
 
-from .conftest import MAC, FakeClient
+from .conftest import MAC, SNAPSHOT, FakeClient
 
 DATA = {CONF_EMAIL: "Parent@Example.com", CONF_PASSWORD: "pw", CONF_CLIENT_ID: "ha-test"}
 
@@ -88,42 +90,102 @@ async def test_setup_outage_retries(hass: HomeAssistant) -> None:
     assert entry.state is ConfigEntryState.SETUP_RETRY
 
 
-async def test_setup_entities_and_unload(hass: HomeAssistant) -> None:
+async def _setup(hass: HomeAssistant) -> MockConfigEntry:
     entry = _entry(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    assert entry.state is ConfigEntryState.LOADED
+    return entry
+
+
+def _ids(hass: HomeAssistant, entry: MockConfigEntry) -> dict[str, er.RegistryEntry]:
     reg = er.async_get(hass)
-    ids = {e.unique_id: e for e in er.async_entries_for_config_entry(reg, entry.entry_id)}
+    return {e.unique_id: e for e in er.async_entries_for_config_entry(reg, entry.entry_id)}
+
+
+async def test_setup_entities_push_and_unload(hass: HomeAssistant) -> None:
+    entry = await _setup(hass)
+    assert entry.state is ConfigEntryState.LOADED
+    ids = _ids(hass, entry)
     assert ids[f"{MAC}_soothe_2h"].disabled_by is er.RegistryEntryDisabler.INTEGRATION
     assert ids[f"{MAC}_online"].entity_category is EntityCategory.DIAGNOSTIC
-    assert hass.states.get(ids[f"{MAC}_night_light"].entity_id).state == "on"
+    light = ids[f"{MAC}_night_light"].entity_id
+    assert hass.states.get(light).state == "unavailable"  # no snapshot yet
     client = FakeClient.last
-    assert await hass.config_entries.async_unload(entry.entry_id)
-    assert ("disconnect",) in client.calls
-
-
-async def test_soothe_guard_and_errors() -> None:
-    client = FakeClient(None, "a@b.c", "pw", "x")
-    await client.fetch_bassinets()
-    switch = HaloSoothe(client, MAC, "soothe_2h")
-    client.states[MAC] = {"motionState": 1, "motion": 3}  # app rocking at level 3
-    await switch.async_turn_on()
-    assert client.calls == []  # no restart of the 2 h window
-    client.states[MAC] = {"motionState": 0, "vibrationState": 0}
-    await switch.async_turn_on()
-    assert client.calls == [("soothe", True)]
-    client.soothe_error = ConnectionError("HALO cloud not connected")
-    with pytest.raises(HomeAssistantError):
-        await switch.async_turn_off()
-
-
-async def test_diagnostics_redacted(hass: HomeAssistant) -> None:
-    entry = _entry(hass)
-    assert await hass.config_entries.async_setup(entry.entry_id)
+    client.push(SNAPSHOT)
     await hass.async_block_till_done()
+    assert hass.states.get(light).state == "on"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert client.disconnected
+
+
+async def test_soothe_through_services(hass: HomeAssistant) -> None:
+    entry = await _setup(hass)
+    soothe = _ids(hass, entry)[f"{MAC}_soothe_2h"].entity_id
+    er.async_get(hass).async_update_entity(soothe, disabled_by=None)
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    client = FakeClient.last
+    client.push({**SNAPSHOT, "motionState": 0, "vibrationState": 0})
+    await hass.async_block_till_done()
+    assert hass.states.get(soothe).state == "off"
+
+    def call(service: str):
+        return hass.services.async_call(
+            "switch", service, {"entity_id": soothe}, blocking=True
+        )
+
+    # two taps at once: one start, not two (no restart of the 2 h window)
+    client.emit_gate = asyncio.Event()
+    taps = [hass.async_create_task(call("turn_on")) for _ in range(2)]
+    await asyncio.sleep(0.05)
+    client.emit_gate.set()
+    await asyncio.gather(*taps)
+    starts = [e for e, d in client.sent if d[f"{api.PREFIX[e]}State"] == 1]
+    assert starts == ["MOTION", "VIBRATION"]
+
+    # rocking at level 3 from the app: Soothe shows off, and turn_on sends nothing
+    client.sent.clear()
+    client.push({"bassinest_id": MAC, "motionState": 1, "motion": 3, "vibrationState": 0})
+    await hass.async_block_till_done()
+    assert hass.states.get(soothe).state == "off"
+    await call("turn_on")
+    assert client.sent == []
+
+    # a cloud drop mid-command surfaces as a clean HA error
+    async def dropped(event, data):
+        raise ConnectionError("HALO cloud not connected")
+
+    client._emit = dropped
+    with pytest.raises(HomeAssistantError):
+        await call("turn_off")
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_diagnostics_fail_closed(hass: HomeAssistant) -> None:
+    FakeClient.bassinet = {
+        "device_name": "Poppy's bassinet",
+        "ip": "203.0.113.9",
+        "timeZone": "America/Los_Angeles",
+        "invitedBy": "grandma@example.org",
+        "settings": json.dumps({"ssid": "HomeNet"}),
+        "firmware_version": "1.2.3",
+    }
+    entry = await _setup(hass)
+    FakeClient.last.push({**SNAPSHOT, "wanIp": "198.51.100.7", "note": "{\"baby\": \"Poppy\"}"})
     diag = await async_get_config_entry_diagnostics(hass, entry)
     text = str(diag)
-    assert MAC not in text and "Poppy" not in text and "Example.com" not in text
-    assert diag["connected"] is True
+    for secret in (MAC, "Poppy", "203.0.113.9", "198.51.100.7", "Los_Angeles",
+                   "grandma", "HomeNet", "Example.com", "pw"):
+        assert secret not in text, secret
+    assert diag["bassinets"][0]["firmware_version"] == "1.2.3"
+    assert "timeZone" in diag["bassinets"][0]["keys"]
     assert diag["states"][0]["nightLightState"] == 1
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_diagnostics_when_not_loaded(hass: HomeAssistant) -> None:
+    FakeClient.fetch_error = RuntimeError("cloud down")
+    entry = _entry(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    diag = await async_get_config_entry_diagnostics(hass, entry)
+    assert diag == {"entry_state": "setup_retry"}
