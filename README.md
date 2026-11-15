@@ -4,15 +4,29 @@ Custom integration for the HALO BassiNest Smart Swivel Sleeper (the WiFi model t
 
 ## What you get (per bassinet)
 
+Everything the HALO app can control:
+
 | Entity | Type | Notes |
 |---|---|---|
-| Online | binary_sensor | bassinet connected to the HALO cloud |
-| Rocking, Vibration | binary_sensor | status |
-| Soothe 2h (low) | switch | disabled by default; lowest rocking + vibration, the bassinet's own 2 h timer ends it (see Safety) |
-| AutoSoothe | binary_sensor | cry-response mode enabled |
-| Night light, Floor light, Back light | light | brightness snaps to 25/50/75/100 |
-| Sound | switch | on/off with the tone and volume last set in the app; tone/volume as attributes |
+| Rocking, Vibration | switch | on/off with the level and timer currently set |
+| Rocking level, Vibration level | select | Low / High |
+| Rocking timer, Vibration timer | number | 1-120 minutes, 0 = no timer |
+| Sound | switch | on/off |
+| Sound | select | Brown Noise, Pink Noise, White Noise, Heart Beat, Stream |
+| Volume | number | 1-3 |
+| Sound timer | number | 1-600 minutes, 0 = no timer |
+| Night light, Floor light, Back light | light | brightness 25/50/75/100% |
+| Night/Floor/Back light timer | number | 1-600 minutes, 0 = no timer |
+| Master timer | number | 1-120 minutes for the whole bassinet, 0 = off |
+| AutoSoothe | switch | respond to crying with the selected preset |
+| Cry sensitivity | number | 1-4 |
+| Preset | select | the account's soothing presets (built-in and your own) |
+| Soothing preset | switch | run the selected preset now |
+| Soothe 2h (low) | switch | one tap: low rocking + vibration on the bassinet's 2 h timer (see Safety) |
 | Turn everything off | button | same as the app's button |
+| Online | binary_sensor | bassinet connected to the HALO cloud |
+
+Levels, timers, volume and sensitivity are configuration entities, so they sit under the device's Configuration section and stay out of the default dashboard. Creating or editing presets stays in the app.
 
 Cry events are not exposed: the app only gets them as push notifications, not over the API.
 
@@ -32,7 +46,9 @@ Tip: invite a second user to the bassinet in the HALO app and give HA that login
 
 ## Safety
 
-The only motion control is the Soothe 2h (low) switch: lowest rocking and vibration level, with the 2 hour stop handed to the bassinet's own timer so it ends even if HA is down. HA also sends a stop 5 minutes after that as a backstop. Turning it on while it is already on does not restart the 2 hours. The switch is disabled by default: enable it under the device's entities if you want it. There are no level or duration knobs. Don't drive it from automations. Lights and sound are fair game.
+This integration can start rocking and vibration on an infant sleeper, the same as the app. Use the bassinet's own timers (set on the bassinet, so they end even if Home Assistant or your network goes down), and think twice before triggering motion from automations or voice assistants.
+
+Soothe 2h (low) is the cautious one-tap option: lowest rocking and vibration on the bassinet's 2 hour timer, plus a stop from Home Assistant 5 minutes after that in case the timer didn't fire. Turning it on while any motion is running does nothing, so it can't extend a session.
 
 ## Limitations
 
