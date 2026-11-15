@@ -324,9 +324,24 @@ def test_backstop_quiet_when_timer_already_stopped(monkeypatch):
         client, sent = _capturing_client()
         await client.soothe(MAC, True)
         client.states[MAC].update(motionState=0, vibrationState=0)  # device timer fired
+        client._snapshot_seen = True
         sent.clear()
         await wait_for(lambda: MAC not in api._backstop_deadlines)
         assert sent == []
+
+    run(body)
+
+
+def test_backstop_stops_when_state_unconfirmed(monkeypatch):  # fail closed
+    monkeypatch.setattr(api, "BACKSTOP", 0.05)
+
+    async def body():
+        client, sent = _capturing_client()
+        await client.soothe(MAC, True)
+        client.states[MAC] = {"bassinest_id": MAC}  # keys missing, no fresh snapshot
+        sent.clear()
+        await wait_for(lambda: MAC not in api._backstop_deadlines)
+        assert [e for e, _ in sent] == ["MOTION", "VIBRATION"]
 
     run(body)
 
@@ -345,6 +360,40 @@ def test_backstop_survives_reload():
             await wait_for(lambda: MAC not in api._backstop_deadlines)
             assert [e for e, _ in cloud.received] == ["MOTION", "VIBRATION"]
             await new.disconnect()
+
+    run(body)
+
+
+def test_double_cancel_still_finishes_rollback():  # round-3 review
+    async def body():
+        client, sent = _capturing_client()
+        never, gate = asyncio.Event(), asyncio.Event()
+        capture = client._emit
+
+        async def slow(event, data):
+            on = data[f"{api.PREFIX[event]}State"]
+            if event == "VIBRATION" and on:
+                await never.wait()
+            if event == "MOTION" and not on:
+                await gate.wait()  # rollback in progress
+            await capture(event, data)
+
+        client._emit = slow  # type: ignore[method-assign]
+        task = asyncio.create_task(client.soothe(MAC, True))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        task.cancel()  # second cancel lands while the rollback is mid-stop
+        await asyncio.sleep(0.01)
+        assert not task.done() and client._soothe_lock(MAC).locked()
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [
+            ("MOTION", 1),
+            ("MOTION", 0),
+            ("VIBRATION", 0),
+        ]
 
     run(body)
 

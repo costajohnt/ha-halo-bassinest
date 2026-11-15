@@ -371,8 +371,16 @@ class HaloClient:
                 for event in ("MOTION", "VIBRATION"):
                     await self.set_control(mac, event, True)
             except BaseException:
-                with suppress(Exception):
-                    await asyncio.shield(self._stop(mac))
+                # Finish the rollback before releasing the lock, even if cancelled again.
+                rollback = asyncio.ensure_future(self._stop(mac))
+                try:
+                    await asyncio.shield(rollback)
+                except asyncio.CancelledError:
+                    with suppress(Exception):
+                        await rollback
+                    raise
+                except Exception:  # noqa: BLE001
+                    pass
                 raise
 
     def _soothe_lock(self, mac: str) -> asyncio.Lock:
@@ -409,11 +417,14 @@ class HaloClient:
             async with self._soothe_lock(mac):
                 if _backstop_deadlines.get(mac, 0) > time.monotonic():
                     continue  # restarted while we waited for the lock
-                state = self.states.get(mac)
-                if state is not None and not (
-                    state.get("motionState") or state.get("vibrationState")
+                state = self.states.get(mac) or {}
+                if (
+                    self._snapshot_seen
+                    and state.get("motionState") == 0
+                    and state.get("vibrationState") == 0
                 ):
-                    # The bassinet timer did its job; nothing to stop.
+                    # Fresh state confirms the bassinet timer did its job. Anything less
+                    # (missing keys, no snapshot yet) sends the stop: a spare off is harmless.
                     _backstop_deadlines.pop(mac, None)
                     self._backstops.pop(mac, None)
                     return
