@@ -39,8 +39,7 @@ CONTROL_EVENTS = (
     "SOOTHING_PRESET",
 )
 
-# Event name -> state field prefix used in payloads. MOTION and VIBRATION are only
-# reachable through soothe(): fixed lowest level, always on the bassinet's own timer.
+# Event name -> state field prefix used in payloads.
 PREFIX = {
     "MOTION": "motion",
     "VIBRATION": "vibration",
@@ -51,6 +50,14 @@ PREFIX = {
 }
 
 DEFAULT_RUNTIME = 30  # minutes, the app's default when no timer is set
+# Ranges from the app's controls (ControlFragment): motion/vibration 1 Low, 2 High;
+# timers in minutes; sound tones 1-5; volume 1-3; light brightness in 25% steps.
+LEVELS = {1: "Low", 2: "High"}
+TONES = {1: "Brown Noise", 2: "Pink Noise", 3: "White Noise", 4: "Heart Beat", 5: "Stream"}
+MAX_RUNTIME = {"motion": 120, "vibration": 120, "global": 120}  # sound, lights: 600
+LIGHT_MAX_RUNTIME = 600
+BRIGHTNESS = (25, 50, 75, 100)
+SENSITIVITY = range(1, 5)
 SOOTHE_LEVEL = 1  # lowest rocking/vibration level
 SOOTHE_MINUTES = 120  # enforced by the bassinet itself, so it stops even if HA is down
 BACKSTOP = (SOOTHE_MINUTES + 5) * 60  # seconds; HA sends a stop if the bassinet timer didn't
@@ -105,6 +112,7 @@ class HaloClient:
         self._snapshot_seen = False
         self._token_dropped = False  # once per outage, see _reconnect
         self._backstops: dict[str, asyncio.Task[None]] = {}
+        self.presets: dict[str, dict[str, str]] = {}  # mac -> preset id -> name
         # Serialises start, stop and the backstop per bassinet, so a stop can't land in
         # the middle of a start or clear a deadline a newer start just set.
         self._soothe_locks: dict[str, asyncio.Lock] = {}
@@ -325,33 +333,120 @@ class HaloClient:
         except socketio.exceptions.SocketIOError as err:  # dropped between check and send
             raise ConnectionError(f"HALO cloud not connected ({err})") from err
 
-    async def set_control(self, mac: str, event: str, on: bool, **values: Any) -> None:
-        """Toggle SOUND/*_LIGHT keeping current settings; MOTION/VIBRATION via soothe() only."""
+    async def set_control(
+        self,
+        mac: str,
+        event: str,
+        on: bool | None = None,
+        *,
+        level: int | None = None,
+        runtime: int | None = None,
+        brightness: int | None = None,
+        sound: int | None = None,
+        volume: int | None = None,
+    ) -> None:
+        """Send one control with the app's full field set; unset values keep current state.
+
+        runtime is the timer in minutes, 0 turns the timer off.
+        """
         p = PREFIX[event]
+        cap = p[0].upper() + p[1:]
         state = self.states.get(mac, {})
-        motion = event in ("MOTION", "VIBRATION")
+        cur_on = int(state.get(f"{p}State", 0))
+        rs = int(state.get(f"{p}RuntimeState", 0))
+        rt = state.get(f"{p}Runtime") or DEFAULT_RUNTIME
+        if runtime is not None:
+            limit = MAX_RUNTIME.get(p, LIGHT_MAX_RUNTIME)
+            if not 0 <= runtime <= limit:
+                raise ValueError(f"{p} timer must be 0-{limit} minutes")
+            rs, rt = (1, runtime) if runtime else (0, DEFAULT_RUNTIME)
         data: dict[str, Any] = {
             "mac": mac,
             "bassinestId": self.bassinets[mac]["id"],
             "device_id": self._client_id,
-            f"{p}State": int(on),
-            f"previous{p[0].upper()}{p[1:]}State": int(state.get(f"{p}State", 0)),
-            f"{p}RuntimeState": 1 if motion else int(state.get(f"{p}RuntimeState", 0)),
-            f"{p}Runtime": SOOTHE_MINUTES
-            if motion
-            else state.get(f"{p}Runtime") or DEFAULT_RUNTIME,
-            f"previous{p[0].upper()}{p[1:]}RuntimeState": int(state.get(f"{p}RuntimeState", 0)),
+            f"{p}State": cur_on if on is None else int(on),
+            f"previous{cap}State": cur_on,
+            f"{p}RuntimeState": rs,
+            f"{p}Runtime": rt,
+            f"previous{cap}RuntimeState": 0 if rs else 1,  # the app's own quirk
         }
-        if motion:
-            data[p] = SOOTHE_LEVEL  # ponytail: hard-coded, no level/duration knob on purpose
+        if event in ("MOTION", "VIBRATION"):
+            data[p] = _check(level, LEVELS, "level") or state.get(p) or SOOTHE_LEVEL
         elif event == "SOUND":
-            data["sound"] = values.get("sound", state.get("sound") or 1)
-            data["volume"] = values.get("volume", state.get("volume") or 1)
+            data["sound"] = _check(sound, TONES, "tone") or state.get("sound") or 1
+            data["volume"] = _check(volume, range(1, 4), "volume") or state.get("volume") or 1
         else:
-            data[f"{p}Brightness"] = values.get(
-                "brightness", state.get(f"{p}Brightness") or 25
+            data[f"{p}Brightness"] = (
+                _check(brightness, BRIGHTNESS, "brightness")
+                or state.get(f"{p}Brightness")
+                or 25
             )
         await self._emit(event, data)
+
+    async def set_global_timer(self, mac: str, minutes: int) -> None:
+        """Master timer for the whole bassinet; 0 turns it off."""
+        if not 0 <= minutes <= MAX_RUNTIME["global"]:
+            raise ValueError("master timer must be 0-120 minutes")
+        state = self.states.get(mac, {})
+        await self._emit(
+            "GLOBAL_RUNTIME",
+            {
+                "mac": mac,
+                "device_id": self._client_id,
+                "globalTimerState": 1 if minutes else 0,
+                "previousGlobalTimerState": int(state.get("globalTimerState", 0)),
+                "globalRuntimeTimer": minutes or state.get("globalRuntimeTimer") or DEFAULT_RUNTIME,
+            },
+        )
+
+    async def set_preset(
+        self,
+        mac: str,
+        *,
+        on: bool | None = None,
+        auto: bool | None = None,
+        sensitivity: int | None = None,
+        preset_id: str | None = None,
+    ) -> None:
+        """Soothing preset on/off and choice, AutoSoothe, cry sensitivity: one event."""
+        state = self.states.get(mac, {})
+        cur_on = int(state.get("soothingPresetState", 0))
+        cur_auto = int(state.get("soothingPresetAutoModeState", 0))
+        await self._emit(
+            "SOOTHING_PRESET",
+            {
+                "mac": mac,
+                "device_id": self._client_id,
+                "soothingPresetId": str(preset_id or state.get("soothingPresetId") or ""),
+                "soothingPresetState": cur_on if on is None else int(on),
+                "previousSoothingPresetState": cur_on,
+                "soothingPresetAutoModeState": cur_auto if auto is None else int(auto),
+                "previousSoothingPresetAutoModeState": cur_auto,
+                "sensitivity": _check(sensitivity, SENSITIVITY, "sensitivity")
+                or state.get("sensitivity")
+                or 1,
+            },
+        )
+        # A preset switches other controls on/off server-side; re-read everything.
+        with suppress(socketio.exceptions.BadNamespaceError):
+            await self._sio.emit("DEVICE_SETTINGS_AND_STATES")
+
+    async def fetch_presets(self, mac: str) -> dict[str, str]:
+        """Preset id -> name for one bassinet (built-in and the account's own)."""
+        token = await self._valid_token()
+        async with self._session.get(
+            f"{REST_URL}/api/soothingPresetInfo/{mac}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=TIMEOUT,
+        ) as resp:
+            resp.raise_for_status()
+            body = await resp.json(content_type=None)
+        presets = {
+            str(p["id"]): str(p.get("soothingPresetName") or p["id"])
+            for p in body.get("allPresets") or []
+        }
+        self.presets[mac] = presets
+        return presets
 
     async def soothe(self, mac: str, on: bool) -> None:
         """Lowest rocking + vibration on the bassinet's 2 h timer, or both off.
@@ -367,7 +462,9 @@ class HaloClient:
             self._arm_backstop(mac)
             try:
                 for event in ("MOTION", "VIBRATION"):
-                    await self.set_control(mac, event, True)
+                    await self.set_control(
+                        mac, event, True, level=SOOTHE_LEVEL, runtime=SOOTHE_MINUTES
+                    )
             except BaseException:
                 # Finish the rollback before releasing the lock, even if cancelled again.
                 rollback = asyncio.ensure_future(self._stop(mac))
@@ -458,3 +555,10 @@ def _loads(value: Any) -> Any:
     except ValueError:
         _LOGGER.warning("Ignoring malformed HALO push")
         return _MALFORMED
+
+
+def _check(value: Any, allowed: Any, what: str) -> Any:
+    """None passes through (keep current); anything outside the app's range is refused."""
+    if value is not None and value not in allowed:
+        raise ValueError(f"{what} {value!r} not in {list(allowed)}")
+    return value

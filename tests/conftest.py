@@ -95,6 +95,7 @@ class FakeCloud:
         self.sio.attach(self.app)
         self.app.router.add_post("/api/auth/login", self._login)
         self.app.router.add_get("/api/user/accountInformation", self._account)
+        self.app.router.add_get("/api/soothingPresetInfo/{mac}", self._presets)
         self.sio.on("connect", self._connect)
         self.sio.on("DEVICE_SETTINGS_AND_STATES", self._snapshot)
         self.sio.on("*", self._echo)
@@ -104,6 +105,18 @@ class FakeCloud:
         if self.login_status != 200:
             return web.json_response({"message": "nope"}, status=self.login_status)
         return web.json_response({"accessToken": make_jwt(time.time() + 3600)})
+
+    async def _presets(self, request: web.Request) -> web.Response:
+        assert request.match_info["mac"] == MAC
+        return web.json_response(
+            {
+                "allPresets": [
+                    {"id": 1, "soothingPresetName": "Calm"},
+                    {"id": 9, "soothingPresetName": "Mine"},
+                ],
+                "presetAssociatedWithMac": {"soothingPresetId": "1"},
+            }
+        )
 
     async def _account(self, request: web.Request) -> web.Response:
         return web.json_response({"account": {"bassinests": [{"id": 7, "mac": MAC}]}})

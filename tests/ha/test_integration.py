@@ -106,7 +106,10 @@ async def test_setup_entities_push_and_unload(hass: HomeAssistant) -> None:
     entry = await _setup(hass)
     assert entry.state is ConfigEntryState.LOADED
     ids = _ids(hass, entry)
-    assert ids[f"{MAC}_soothe_2h"].disabled_by is er.RegistryEntryDisabler.INTEGRATION
+    assert ids[f"{MAC}_soothe_2h"].disabled_by is None  # full control, nothing hidden
+    for key in ("rocking", "vibration", "autosoothe", "soothing_preset", "rocking_level",
+                "tone", "preset", "rocking_timer", "master_timer", "volume", "sensitivity"):
+        assert f"{MAC}_{key}" in ids, key
     assert ids[f"{MAC}_online"].entity_category is EntityCategory.DIAGNOSTIC
     light = ids[f"{MAC}_night_light"].entity_id
     assert hass.states.get(light).state == "unavailable"  # no snapshot yet
@@ -121,9 +124,6 @@ async def test_setup_entities_push_and_unload(hass: HomeAssistant) -> None:
 async def test_soothe_through_services(hass: HomeAssistant) -> None:
     entry = await _setup(hass)
     soothe = _ids(hass, entry)[f"{MAC}_soothe_2h"].entity_id
-    er.async_get(hass).async_update_entity(soothe, disabled_by=None)
-    await hass.config_entries.async_reload(entry.entry_id)
-    await hass.async_block_till_done()
     client = FakeClient.last
     client.push({**SNAPSHOT, "motionState": 0, "vibrationState": 0})
     await hass.async_block_till_done()
@@ -143,9 +143,9 @@ async def test_soothe_through_services(hass: HomeAssistant) -> None:
     starts = [e for e, d in client.sent if d[f"{api.PREFIX[e]}State"] == 1]
     assert starts == ["MOTION", "VIBRATION"]
 
-    # rocking at level 3 from the app: Soothe shows off, and turn_on sends nothing
+    # rocking on High: Soothe shows off, and turn_on sends nothing
     client.sent.clear()
-    client.push({"bassinest_id": MAC, "motionState": 1, "motion": 3, "vibrationState": 0})
+    client.push({"bassinest_id": MAC, "motionState": 1, "motion": 2, "vibrationState": 0})
     await hass.async_block_till_done()
     assert hass.states.get(soothe).state == "off"
     await call("turn_on")
@@ -189,3 +189,56 @@ async def test_diagnostics_when_not_loaded(hass: HomeAssistant) -> None:
     await hass.config_entries.async_setup(entry.entry_id)
     diag = await async_get_config_entry_diagnostics(hass, entry)
     assert diag == {"entry_state": "setup_retry"}
+
+
+async def test_retired_sensors_removed(hass: HomeAssistant) -> None:
+    entry = _entry(hass)
+    reg = er.async_get(hass)
+    old = reg.async_get_or_create(
+        "binary_sensor", DOMAIN, f"{MAC}_motion", config_entry=entry
+    ).entity_id
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert reg.async_get(old) is None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_every_control_through_services(hass: HomeAssistant) -> None:
+    entry = await _setup(hass)
+    ids = {k.removeprefix(f"{MAC}_"): v.entity_id for k, v in _ids(hass, entry).items()}
+    client = FakeClient.last
+    client.push({**SNAPSHOT, "motion": 1, "motionState": 0, "soothingPresetId": "1",
+                 "sensitivity": 2, "volume": 1, "sound": 1})
+    await hass.async_block_till_done()
+    assert hass.states.get(ids["preset"]).state == "Calm"
+    assert hass.states.get(ids["rocking_level"]).state == "Low"
+
+    async def call(domain, service, key, **data):
+        await hass.services.async_call(
+            domain, service, {"entity_id": ids[key], **data}, blocking=True
+        )
+        return client.sent[-1]
+
+    e, d = await call("select", "select_option", "rocking_level", option="High")
+    assert e == "MOTION" and d["motion"] == 2 and d["motionState"] == 0
+    e, d = await call("number", "set_value", "rocking_timer", value=45)
+    assert e == "MOTION" and (d["motionRuntime"], d["motionRuntimeState"]) == (45, 1)
+    e, d = await call("switch", "turn_on", "rocking")
+    assert e == "MOTION" and d["motionState"] == 1
+    e, d = await call("select", "select_option", "tone", option="Heart Beat")
+    assert e == "SOUND" and d["sound"] == 4
+    e, d = await call("number", "set_value", "volume", value=3)
+    assert e == "SOUND" and d["volume"] == 3
+    e, d = await call("number", "set_value", "night_light_timer", value=600)
+    assert e == "NIGHT_LIGHT" and d["nightLightRuntime"] == 600
+    e, d = await call("number", "set_value", "master_timer", value=30)
+    assert e == "GLOBAL_RUNTIME" and d["globalRuntimeTimer"] == 30
+    e, d = await call("switch", "turn_on", "autosoothe")
+    assert e == "SOOTHING_PRESET" and d["soothingPresetAutoModeState"] == 1
+    e, d = await call("number", "set_value", "sensitivity", value=4)
+    assert e == "SOOTHING_PRESET" and d["sensitivity"] == 4
+    e, d = await call("select", "select_option", "preset", option="Mine")
+    assert e == "SOOTHING_PRESET" and d["soothingPresetId"] == "9"
+    e, d = await call("switch", "turn_on", "soothing_preset")
+    assert e == "SOOTHING_PRESET" and d["soothingPresetState"] == 1
+    assert await hass.config_entries.async_unload(entry.entry_id)
