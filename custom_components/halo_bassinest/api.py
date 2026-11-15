@@ -178,6 +178,9 @@ class HaloClient:
                     _LOGGER.exception("HALO reauth callback failed")
                 return
             except Exception as err:  # noqa: BLE001
+                # A token revoked before exp gets rejected here, not in login(): drop it
+                # so the next attempt logs in fresh and a bad password reaches AuthError.
+                self._token = None
                 _LOGGER.warning("HALO reconnect failed (%s), retrying in %ss", err, self._delay)
                 continue
             if self._closed:  # unloaded while the handshake swallowed our cancel
@@ -237,14 +240,16 @@ class HaloClient:
 
         @sio.on("DEVICE_SETTINGS_AND_STATES")
         async def snapshot(items: Any) -> None:
+            parsed = _loads(items)
+            if parsed is None and items is not None:
+                return  # malformed: keep polling for a good snapshot
             self._snapshot_seen = True
-            for item in _loads(items) or []:
+            for item in parsed or []:
                 self._store(item)
             unknown = set(self.states) - set(self.bassinets)
             if unknown:
-                _LOGGER.warning(
-                    "Snapshot ids %s match no account MAC %s", unknown, list(self.bassinets)
-                )
+                _LOGGER.warning("Snapshot has %d id(s) matching no account MAC", len(unknown))
+                _LOGGER.debug("Unmatched ids %s, account MACs %s", unknown, list(self.bassinets))
             self._notify()
 
         @sio.on("DEVICE_SETTING_AND_STATE")
@@ -258,7 +263,8 @@ class HaloClient:
     def _store(self, item: Any) -> None:
         mac = item.get("bassinest_id") if isinstance(item, dict) else None
         if not mac:
-            _LOGGER.warning("Ignoring HALO push without bassinest_id: %r", item)
+            _LOGGER.warning("Ignoring HALO push without bassinest_id")
+            _LOGGER.debug("Push without bassinest_id: %r", item)
             return
         self.states.setdefault(mac, {}).update(item)
 
@@ -269,7 +275,8 @@ class HaloClient:
             return
         if data.get("turnEveryThingOff"):
             # Server also pushes per-control updates; ask for a fresh snapshot to be sure.
-            await self._sio.emit("DEVICE_SETTINGS_AND_STATES")
+            with suppress(socketio.exceptions.BadNamespaceError):
+                await self._sio.emit("DEVICE_SETTINGS_AND_STATES")
             return
         self.states.setdefault(mac, {}).update(data)
         self._notify()
@@ -279,7 +286,10 @@ class HaloClient:
             raise ConnectionError("HALO cloud not connected")
         data = {"eventId": int(time.time() * 1000), **data}
         # The app sends the payload as a JSON *string*, not an object.
-        await self._sio.emit(event, json.dumps({"action": event, "data": data}))
+        try:
+            await self._sio.emit(event, json.dumps({"action": event, "data": data}))
+        except socketio.exceptions.SocketIOError as err:  # dropped between check and send
+            raise ConnectionError(f"HALO cloud not connected ({err})") from err
 
     async def set_control(self, mac: str, event: str, on: bool, **values: Any) -> None:
         """Toggle SOUND/*_LIGHT keeping current settings; MOTION/VIBRATION via soothe() only."""
@@ -310,14 +320,37 @@ class HaloClient:
         await self._emit(event, data)
 
     async def soothe(self, mac: str, on: bool) -> None:
-        """Lowest rocking + vibration on the bassinet's 2 h timer, or both off."""
+        """Lowest rocking + vibration on the bassinet's 2 h timer, or both off.
+
+        Never leaves half the pair applied: a failed start sends both off, and a stop
+        tries both before raising.
+        """
+        errors: list[Exception] = []
         for event in ("MOTION", "VIBRATION"):
-            await self.set_control(mac, event, on)
+            try:
+                await self.set_control(mac, event, on)
+            except Exception as err:
+                if on:
+                    with suppress(Exception):
+                        await self.soothe(mac, False)
+                    raise
+                errors.append(err)
+        if errors:
+            raise errors[0]
 
     async def turn_everything_off(self, mac: str) -> None:
         await self._emit("TURN_EVERYTHING_OFF", {"turnEveryThingOff": True, "mac": mac})
 
 
 def _loads(value: Any) -> Any:
-    """Pushes are normally objects, but accept JSON strings like the app sends."""
-    return json.loads(value) if isinstance(value, str) else value
+    """Pushes are normally objects, but accept JSON strings like the app sends.
+
+    Returns None for a string that is not JSON.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        _LOGGER.warning("Ignoring malformed HALO push")
+        return None

@@ -19,4 +19,4 @@ async def async_setup_entry(
 
 class HaloOff(HaloEntity, ButtonEntity):
     async def async_press(self) -> None:
-        await self.client.turn_everything_off(self.mac)
+        await self._send(self.client.turn_everything_off(self.mac))

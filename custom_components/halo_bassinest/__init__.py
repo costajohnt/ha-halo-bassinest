@@ -34,7 +34,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaloConfigEntry) -> bool
         raise ConfigEntryNotReady(str(err)) from err
 
     entry.runtime_data = client
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        await client.disconnect()  # don't leave a socket and reconnect loop behind
+        raise
     return True
 
 

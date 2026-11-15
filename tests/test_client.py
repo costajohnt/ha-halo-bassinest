@@ -172,19 +172,90 @@ def test_failing_listener_does_not_block_others():  # audit L3
     assert seen == [1]
 
 
-def test_soothe_is_lowest_level_on_device_timer():
+def _capturing_client(fail: set[str] | None = None):
     client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
     client.bassinets = {MAC: {"id": 7}}
-    client.states = {MAC: {"motion": 3, "motionRuntime": 600, "motionRuntimeState": 0}}
+    # Non-default saved settings for both prefixes: soothe must override them all.
+    client.states = {
+        MAC: {
+            "motion": 3, "motionRuntime": 600, "motionRuntimeState": 0,
+            "vibration": 4, "vibrationRuntime": 600, "vibrationRuntimeState": 0,
+        }
+    }
     sent: list[tuple[str, dict]] = []
 
     async def capture(event, data):
+        if fail and event in fail and data[f"{api.PREFIX[event]}State"] == 1:
+            raise ConnectionError("dropped")
+        if fail and "off:" + event in fail and data[f"{api.PREFIX[event]}State"] == 0:
+            raise ConnectionError("dropped")
         sent.append((event, data))
 
     client._emit = capture  # type: ignore[method-assign]
+    return client, sent
+
+
+def test_soothe_is_lowest_level_on_device_timer():
+    client, sent = _capturing_client()
     asyncio.run(client.soothe(MAC, True))
     assert [e for e, _ in sent] == ["MOTION", "VIBRATION"]
-    for _, d in sent:
-        p = "motion" if "motionState" in d else "vibration"
+    for e, d in sent:
+        p = api.PREFIX[e]
         assert d[p] == 1 and d[f"{p}State"] == 1
         assert d[f"{p}Runtime"] == 120 and d[f"{p}RuntimeState"] == 1
+    # kwargs cannot raise the level
+    sent.clear()
+    asyncio.run(client.set_control(MAC, "MOTION", True, motion=5))
+    assert sent[0][1]["motion"] == 1
+
+
+def test_soothe_off_sends_both_off():
+    client, sent = _capturing_client()
+    asyncio.run(client.soothe(MAC, False))
+    assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [("MOTION", 0), ("VIBRATION", 0)]
+
+
+def test_light_off_payload():
+    client, sent = _capturing_client()
+    asyncio.run(client.set_control(MAC, "NIGHT_LIGHT", False))
+    assert sent[0][1]["nightLightState"] == 0
+
+
+def test_soothe_failed_start_rolls_back():
+    client, sent = _capturing_client(fail={"VIBRATION"})
+    with pytest.raises(ConnectionError):
+        asyncio.run(client.soothe(MAC, True))
+    # motion went on, then both were sent off: never left half on
+    assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [
+        ("MOTION", 1), ("MOTION", 0), ("VIBRATION", 0)
+    ]
+
+
+def test_soothe_stop_tries_both_even_if_first_fails():
+    client, sent = _capturing_client(fail={"off:MOTION"})
+    with pytest.raises(ConnectionError):
+        asyncio.run(client.soothe(MAC, False))
+    assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [("VIBRATION", 0)]
+
+
+def test_failed_reconnect_drops_token():  # audit 2026-11-14 M5
+    client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
+    client._token = make_jwt(time.time() + 3600)
+    client._delay = 0
+
+    async def rejected():
+        client._closed = True  # one attempt only
+        raise ConnectionError("token rejected")
+
+    client.connect = rejected  # type: ignore[method-assign]
+    asyncio.run(client._reconnect())
+    assert client._token is None
+
+
+def test_malformed_snapshot_keeps_polling():  # audit 2026-11-14 L2
+    client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
+    handler = client._sio.handlers["/"]["DEVICE_SETTINGS_AND_STATES"]
+    asyncio.run(handler("{not json"))
+    assert client._snapshot_seen is False
+    asyncio.run(handler([]))
+    assert client._snapshot_seen is True
