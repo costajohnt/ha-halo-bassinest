@@ -12,6 +12,8 @@ from . import HaloConfigEntry
 from .api import SOOTHE_LEVEL
 from .entity import HaloEntity
 
+PARALLEL_UPDATES = 0  # push-only; emits are already sequential on one socket
+
 TONES = ["Brown Noise", "Pink Noise", "White Noise", "Heart Beat", "Stream"]
 
 

@@ -12,6 +12,8 @@ from . import HaloConfigEntry
 from .api import PREFIX
 from .entity import HaloEntity
 
+PARALLEL_UPDATES = 0  # push-only; emits are already sequential on one socket
+
 LIGHTS = {"night_light": "NIGHT_LIGHT", "floor_light": "FLOOR_LIGHT", "back_light": "BACK_LIGHT"}
 
 

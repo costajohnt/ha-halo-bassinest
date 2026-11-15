@@ -9,6 +9,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import HaloConfigEntry
 from .entity import HaloEntity
 
+PARALLEL_UPDATES = 0  # push-only; emits are already sequential on one socket
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: HaloConfigEntry, add: AddEntitiesCallback
