@@ -6,14 +6,14 @@ from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import HaloConfigEntry
 from .entity import HaloEntity
 
-# key -> state field. ponytail: motion/vibration are deliberately read-only;
-# HA automations driving infant rocking is a safety call, add switches only on purpose.
+# key -> state field. Motion status only; the Soothe 2h switch is the sole motion control.
 SENSORS = {
     "motion": "motionState",
     "vibration": "vibrationState",
@@ -40,6 +40,7 @@ class HaloFlag(HaloEntity, BinarySensorEntity):
 
 class HaloOnline(HaloEntity, BinarySensorEntity):
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def available(self) -> bool:
