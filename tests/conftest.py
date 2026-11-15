@@ -140,6 +140,7 @@ class FakeCloud:
                 )
         if self.echo:
             await self.sio.emit(event, payload, to=sid)
+        return {"status": "ok"}  # delivered only if the client asked for an ack
 
     async def kick(self) -> None:
         await self.sio.disconnect(self.sids[-1])

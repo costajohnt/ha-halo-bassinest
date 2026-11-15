@@ -351,6 +351,9 @@ class HaloClient:
             with suppress(socketio.exceptions.BadNamespaceError):
                 await self._sio.emit("DEVICE_SETTINGS_AND_STATES")
 
+    def _on_ack(self, *reply: Any) -> None:
+        _LOGGER.debug("HALO ack %r", reply)
+
     def _confirmed(self, mac: str, item: dict[str, Any]) -> None:
         sent = self._sent.get(mac)
         if sent:
@@ -363,7 +366,12 @@ class HaloClient:
         data = {"eventId": int(time.time() * 1000), **data}
         # The app sends the payload as a JSON *string*, not an object.
         try:
-            await self._sio.emit(event, json.dumps({"action": event, "data": data}))
+            # Always ask for an ack, like the app. Some cloud handlers reply
+            # unconditionally; without an ack request the cloud drops the socket
+            # (seen live 2026-11-15 on GLOBAL_RUNTIME, Soothe off and preset stop).
+            await self._sio.emit(
+                event, json.dumps({"action": event, "data": data}), callback=self._on_ack
+            )
         except socketio.exceptions.SocketIOError as err:  # dropped between check and send
             raise ConnectionError(f"HALO cloud not connected ({err})") from err
 

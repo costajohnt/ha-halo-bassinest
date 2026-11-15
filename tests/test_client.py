@@ -652,3 +652,20 @@ def test_periodic_refresh_sees_device_side_changes(monkeypatch):  # timer ends u
                 await client.disconnect()
 
     run(body)
+
+
+def test_every_command_requests_an_ack():  # live 2026-11-15: cloud drops unacked sockets
+    async def body():
+        async with fake_cloud() as cloud:
+            client = await connected_client(cloud)
+            acks: list[tuple] = []
+            client._on_ack = lambda *reply: acks.append(reply)  # type: ignore[method-assign]
+            try:
+                await client.set_global_timer(MAC, 5)
+                await client.turn_everything_off(MAC)
+                await wait_for(lambda: len(acks) == 2)
+                assert acks[0] == ({"status": "ok"},)
+            finally:
+                await client.disconnect()
+
+    run(body)
