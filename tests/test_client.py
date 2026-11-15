@@ -44,7 +44,7 @@ def test_disconnect_clears_state_until_fresh_snapshot():  # audit H2
                 await asyncio.wait_for(wait_for(lambda: not client.connected), 5)
                 assert client.states == {}
                 await wait_for(lambda: client.connected)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.3)  # several snapshot retries: none answered
                 assert client.states == {}, "pre-drop state must not come back as fresh"
                 cloud.answer_snapshot = True
                 await client._sio.emit("DEVICE_SETTINGS_AND_STATES")
@@ -82,7 +82,7 @@ def test_rejected_login_stops_reconnect_and_reports():  # audit M3
                 cloud.proxy.drop_all()
                 await wait_for(lambda: failures)
                 n = len(cloud.logins)
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(1.0)  # 5+ retry windows at test delays
                 assert len(cloud.logins) == n, "kept retrying login after rejection"
                 assert failures == [1]
                 assert not client.connected
@@ -93,19 +93,26 @@ def test_rejected_login_stops_reconnect_and_reports():  # audit M3
 
 
 def test_reconnect_backs_off(monkeypatch):  # audit M3
-    monkeypatch.setattr(api, "RECONNECT_DELAY", 0.1)
-    monkeypatch.setattr(api, "RECONNECT_MAX", 0.4)
+    monkeypatch.setattr(api, "RECONNECT_DELAY", 0.05)
+    monkeypatch.setattr(api, "RECONNECT_MAX", 0.2)
+    delays: list[float] = []  # delay the loop just slept, read at each attempt
 
     async def body():
         async with fake_cloud() as cloud:
             client = await connected_client(cloud)
+            orig_connect = client.connect
+
+            async def spy():
+                delays.append(client._delay)  # already doubled for the next attempt
+                await orig_connect()
+
+            client.connect = spy  # type: ignore[method-assign]
             try:
                 client._token = make_jwt(time.time() - 10)
                 api.REST_URL = "http://127.0.0.1:1"  # login unreachable
                 cloud.proxy.drop_all()
-                await asyncio.sleep(1.6)
-                attempts = client._attempts
-                assert 3 <= attempts <= 5, attempts  # 0.1, 0.2, 0.4, 0.4 ... not 16
+                await wait_for(lambda: len(delays) >= 4)
+                assert delays[:4] == [0.1, 0.2, 0.2, 0.2], delays  # doubles, then capped
                 api.REST_URL = cloud.rest_url
                 await wait_for(lambda: client.connected and MAC in client.states)
             finally:

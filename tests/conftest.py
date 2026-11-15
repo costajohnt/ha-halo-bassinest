@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiohttp
+import pytest
 import socketio
 from aiohttp import web
 
@@ -22,6 +23,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "custom_components" / "hal
 import api  # noqa: E402
 
 MAC = "AA:BB:CC:DD:EE:FF"
+
+
+@pytest.fixture(autouse=True)
+def fast_delays(monkeypatch):
+    """Production delays are seconds; tests that care about timing set their own."""
+    monkeypatch.setattr(api, "RECONNECT_DELAY", 0.05)
+    monkeypatch.setattr(api, "RECONNECT_MAX", 0.2)
+    monkeypatch.setattr(api, "SNAPSHOT_RETRY", 0.1)
 
 
 def make_jwt(exp: float) -> str:
