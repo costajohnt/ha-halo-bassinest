@@ -51,7 +51,7 @@ class HaloLight(HaloEntity, LightEntity):
         values = {}
         if ATTR_BRIGHTNESS in kwargs:
             values["brightness"] = to_halo(kwargs[ATTR_BRIGHTNESS])
-        await self.client.set_control(self.mac, self._event, True, **values)
+        await self._send(self.client.set_control(self.mac, self._event, True, **values))
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self.client.set_control(self.mac, self._event, False)
+        await self._send(self.client.set_control(self.mac, self._event, False))

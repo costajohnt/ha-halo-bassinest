@@ -172,19 +172,325 @@ def test_failing_listener_does_not_block_others():  # audit L3
     assert seen == [1]
 
 
-def test_soothe_is_lowest_level_on_device_timer():
+def _capturing_client(fail: set[str] | None = None):
     client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
     client.bassinets = {MAC: {"id": 7}}
-    client.states = {MAC: {"motion": 3, "motionRuntime": 600, "motionRuntimeState": 0}}
+    # Non-default saved settings for both prefixes: soothe must override them all.
+    client.states = {
+        MAC: {
+            "motion": 3, "motionRuntime": 600, "motionRuntimeState": 0, "motionState": 1,
+            "vibration": 4, "vibrationRuntime": 600, "vibrationRuntimeState": 0,
+            "vibrationState": 1,
+        }
+    }
     sent: list[tuple[str, dict]] = []
 
     async def capture(event, data):
+        if fail and event in fail and data[f"{api.PREFIX[event]}State"] == 1:
+            raise ConnectionError("dropped")
+        if fail and "off:" + event in fail and data[f"{api.PREFIX[event]}State"] == 0:
+            raise ConnectionError("dropped")
         sent.append((event, data))
 
     client._emit = capture  # type: ignore[method-assign]
+    return client, sent
+
+
+def test_soothe_is_lowest_level_on_device_timer():
+    client, sent = _capturing_client()
     asyncio.run(client.soothe(MAC, True))
     assert [e for e, _ in sent] == ["MOTION", "VIBRATION"]
-    for _, d in sent:
-        p = "motion" if "motionState" in d else "vibration"
+    for e, d in sent:
+        p = api.PREFIX[e]
         assert d[p] == 1 and d[f"{p}State"] == 1
         assert d[f"{p}Runtime"] == 120 and d[f"{p}RuntimeState"] == 1
+    # kwargs cannot raise the level
+    sent.clear()
+    asyncio.run(client.set_control(MAC, "MOTION", True, motion=5))
+    assert sent[0][1]["motion"] == 1
+
+
+def test_soothe_off_sends_both_off():
+    client, sent = _capturing_client()
+    asyncio.run(client.soothe(MAC, False))
+    assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [("MOTION", 0), ("VIBRATION", 0)]
+
+
+def test_light_off_payload():
+    client, sent = _capturing_client()
+    asyncio.run(client.set_control(MAC, "NIGHT_LIGHT", False))
+    assert sent[0][1]["nightLightState"] == 0
+
+
+def test_soothe_failed_start_rolls_back():
+    client, sent = _capturing_client(fail={"VIBRATION"})
+    with pytest.raises(ConnectionError):
+        asyncio.run(client.soothe(MAC, True))
+    # motion went on, then both were sent off: never left half on
+    assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [
+        ("MOTION", 1), ("MOTION", 0), ("VIBRATION", 0)
+    ]
+
+
+def test_soothe_stop_tries_both_even_if_first_fails():
+    client, sent = _capturing_client(fail={"off:MOTION"})
+    with pytest.raises(ConnectionError):
+        asyncio.run(client.soothe(MAC, False))
+    assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [("VIBRATION", 0)]
+
+
+@pytest.fixture(autouse=True)
+def _clear_backstops():
+    api._backstop_deadlines.clear()
+    yield
+    api._backstop_deadlines.clear()
+
+
+def test_socket_refusal_drops_token_once_per_outage():  # audit 2026-11-14 M5
+    client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
+    client._delay = 0
+    calls = 0
+
+    seen: list[str | None] = []
+
+    async def refused():
+        nonlocal calls
+        calls += 1
+        seen.append(client._token)  # token this attempt would have logged in with
+        client._token = "fresh"  # stands in for the re-login connect() would do
+        client._closed = calls >= 3
+        raise api.socketio.exceptions.ConnectionError("token rejected")
+
+    client._token = "stale"
+    client.connect = refused  # type: ignore[method-assign]
+    asyncio.run(client._reconnect())
+    # dropped after the first refusal only: one re-login per outage, no storm
+    assert seen == ["stale", None, "fresh"]
+
+
+def test_network_error_keeps_token():  # adversarial review: no relogin per outage retry
+    client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
+    client._delay = 0
+
+    async def offline():
+        client._closed = True
+        raise aiohttp.ClientConnectionError("offline")
+
+    client._token = "kept"
+    client.connect = offline  # type: ignore[method-assign]
+    asyncio.run(client._reconnect())
+    assert client._token == "kept"
+
+
+def test_backstop_armed_on_start_and_cleared_by_stop():
+    async def body():
+        client, sent = _capturing_client()
+        await client.soothe(MAC, True)
+        assert MAC in api._backstop_deadlines and not client._backstops[MAC].done()
+        task = client._backstops[MAC]
+        await client.soothe(MAC, False)
+        await asyncio.sleep(0)
+        assert MAC not in api._backstop_deadlines and task.cancelled()
+
+    run(body)
+
+
+def test_backstop_stops_and_retries_when_cloud_down(monkeypatch):
+    monkeypatch.setattr(api, "BACKSTOP", 0.05)
+    monkeypatch.setattr(api, "BACKSTOP_RETRY", 0.05)
+
+    async def body():
+        fail = {"off:MOTION"}
+        client, sent = _capturing_client(fail=fail)
+        await client.soothe(MAC, True)
+
+        def offs():
+            return [e for e, d in sent if d[f"{api.PREFIX[e]}State"] == 0]
+
+        await wait_for(lambda: offs())  # deadline passed, stop failed on MOTION
+        assert offs()[0] == "VIBRATION"  # stop still tried the other control
+        assert MAC in api._backstop_deadlines
+        fail.clear()  # cloud back: a retry succeeds and clears the deadline
+        await wait_for(lambda: MAC not in api._backstop_deadlines)
+        assert "MOTION" in offs()
+
+    run(body)
+
+
+def test_backstop_quiet_when_timer_already_stopped(monkeypatch):
+    monkeypatch.setattr(api, "BACKSTOP", 0.05)
+
+    async def body():
+        client, sent = _capturing_client()
+        await client.soothe(MAC, True)
+        client.states[MAC].update(motionState=0, vibrationState=0)  # device timer fired
+        client._snapshot_seen = True
+        sent.clear()
+        await wait_for(lambda: MAC not in api._backstop_deadlines)
+        assert sent == []
+
+    run(body)
+
+
+def test_backstop_stops_when_state_unconfirmed(monkeypatch):  # fail closed
+    monkeypatch.setattr(api, "BACKSTOP", 0.05)
+
+    async def body():
+        client, sent = _capturing_client()
+        await client.soothe(MAC, True)
+        client.states[MAC] = {"bassinest_id": MAC}  # keys missing
+        client._snapshot_seen = True  # even with a fresh snapshot, missing keys fail closed
+        sent.clear()
+        await wait_for(lambda: MAC not in api._backstop_deadlines)
+        assert [e for e, _ in sent] == ["MOTION", "VIBRATION"]
+
+    run(body)
+
+
+def test_backstop_stops_when_off_state_not_from_snapshot(monkeypatch):
+    monkeypatch.setattr(api, "BACKSTOP", 0.05)
+
+    async def body():
+        client, sent = _capturing_client()
+        await client.soothe(MAC, True)
+        client.states[MAC].update(motionState=0, vibrationState=0)
+        client._snapshot_seen = False  # e.g. after a reconnect, before the snapshot
+        sent.clear()
+        await wait_for(lambda: MAC not in api._backstop_deadlines)
+        assert [e for e, _ in sent] == ["MOTION", "VIBRATION"]
+
+    run(body)
+
+
+def test_backstop_survives_reload():
+    async def body():
+        async with fake_cloud() as cloud:
+            cloud.snapshot_items[0].update(motionState=1, motion=1)
+            old = await connected_client(cloud)
+            await old.soothe(MAC, True)
+            await old.disconnect()  # reload: tasks stop, deadline stays
+            assert MAC in api._backstop_deadlines and not old._backstops
+            api._backstop_deadlines[MAC] = 0  # overdue by the time the new client connects
+            cloud.received.clear()
+            new = await connected_client(cloud)  # connect() re-arms
+            await wait_for(lambda: MAC not in api._backstop_deadlines)
+            assert [e for e, _ in cloud.received] == ["MOTION", "VIBRATION"]
+            await new.disconnect()
+
+    run(body)
+
+
+def test_double_cancel_still_finishes_rollback():  # round-3 review
+    async def body():
+        client, sent = _capturing_client()
+        never, gate = asyncio.Event(), asyncio.Event()
+        capture = client._emit
+
+        async def slow(event, data):
+            on = data[f"{api.PREFIX[event]}State"]
+            if event == "VIBRATION" and on:
+                await never.wait()
+            if event == "MOTION" and not on:
+                await gate.wait()  # rollback in progress
+            await capture(event, data)
+
+        client._emit = slow  # type: ignore[method-assign]
+        task = asyncio.create_task(client.soothe(MAC, True))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        task.cancel()  # second cancel lands while the rollback is mid-stop
+        await asyncio.sleep(0.01)
+        task.cancel()  # and a third
+        await asyncio.sleep(0.01)
+        assert not task.done() and client._soothe_lock(MAC).locked()
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [
+            ("MOTION", 1),
+            ("MOTION", 0),
+            ("VIBRATION", 0),
+        ]
+
+    run(body)
+
+
+def test_stop_waits_for_inflight_start():  # round-2 review: no stop mid-start
+    async def body():
+        client, sent = _capturing_client()
+        gate = asyncio.Event()
+        capture = client._emit
+
+        async def slow(event, data):
+            if event == "VIBRATION" and data["vibrationState"] == 1:
+                await gate.wait()
+            await capture(event, data)
+
+        client._emit = slow  # type: ignore[method-assign]
+        start = asyncio.create_task(client.soothe(MAC, True))
+        await asyncio.sleep(0.01)
+        stop = asyncio.create_task(client.soothe(MAC, False))
+        await asyncio.sleep(0.01)
+        gate.set()
+        await asyncio.gather(start, stop)
+        assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [
+            ("MOTION", 1),
+            ("VIBRATION", 1),
+            ("MOTION", 0),
+            ("VIBRATION", 0),
+        ]
+        assert MAC not in api._backstop_deadlines
+
+    run(body)
+
+
+def test_cancel_mid_start_rolls_back():
+    async def body():
+        client, sent = _capturing_client()
+        gate = asyncio.Event()
+        capture = client._emit
+
+        async def slow(event, data):
+            if event == "VIBRATION" and data["vibrationState"] == 1:
+                await gate.wait()  # never set: cancelled here
+            await capture(event, data)
+
+        client._emit = slow  # type: ignore[method-assign]
+        task = asyncio.create_task(client.soothe(MAC, True))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.01)
+        assert [(e, d[f"{api.PREFIX[e]}State"]) for e, d in sent] == [
+            ("MOTION", 1),
+            ("MOTION", 0),
+            ("VIBRATION", 0),
+        ]
+
+    run(body)
+
+
+def test_malformed_snapshot_keeps_polling():  # audit 2026-11-14 L2
+    client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
+    handler = client._sio.handlers["/"]["DEVICE_SETTINGS_AND_STATES"]
+    asyncio.run(handler("{not json"))
+    assert client._snapshot_seen is False
+    asyncio.run(handler('"5"'))  # parses, but not a list
+    assert client._snapshot_seen is False
+    asyncio.run(handler("null"))  # valid JSON, empty answer: not malformed
+    assert client._snapshot_seen is True
+    client._snapshot_seen = False
+    asyncio.run(handler([]))
+    assert client._snapshot_seen is True
+
+
+def test_motion_running_blocks_retrigger_at_any_level():  # switch guard input
+    client, _ = _capturing_client()
+    client.states[MAC] = {"motionState": 1, "motion": 3}  # app rocking at level 3
+    assert client.motion_running(MAC)
+    client.states[MAC] = {"vibrationState": 1}  # half on
+    assert client.motion_running(MAC)
+    client.states[MAC] = {"motionState": 0, "vibrationState": 0}
+    assert not client.motion_running(MAC)
