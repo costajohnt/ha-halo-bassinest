@@ -33,7 +33,10 @@
       "floor_light": { "name": "Floor light" },
       "back_light": { "name": "Back light" }
     },
-    "switch": { "sound": { "name": "Sound" } },
+    "switch": {
+      "sound": { "name": "Sound" },
+      "soothe_2h": { "name": "Soothe 2h (low)" }
+    },
     "button": { "turn_everything_off": { "name": "Turn everything off" } }
   }
 }

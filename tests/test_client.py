@@ -172,10 +172,19 @@ def test_failing_listener_does_not_block_others():  # audit L3
     assert seen == [1]
 
 
-def test_motion_is_not_controllable():  # audit L6
+def test_soothe_is_lowest_level_on_device_timer():
     client = api.HaloClient(None, "a@b.c", "pw", "ha-test")  # type: ignore[arg-type]
     client.bassinets = {MAC: {"id": 7}}
-    client.connected = True
-    for event in ("MOTION", "VIBRATION"):
-        with pytest.raises(KeyError):
-            asyncio.run(client.set_control(MAC, event, True))
+    client.states = {MAC: {"motion": 3, "motionRuntime": 600, "motionRuntimeState": 0}}
+    sent: list[tuple[str, dict]] = []
+
+    async def capture(event, data):
+        sent.append((event, data))
+
+    client._emit = capture  # type: ignore[method-assign]
+    asyncio.run(client.soothe(MAC, True))
+    assert [e for e, _ in sent] == ["MOTION", "VIBRATION"]
+    for _, d in sent:
+        p = "motion" if "motionState" in d else "vibration"
+        assert d[p] == 1 and d[f"{p}State"] == 1
+        assert d[f"{p}Runtime"] == 120 and d[f"{p}RuntimeState"] == 1
