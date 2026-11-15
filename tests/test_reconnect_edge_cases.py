@@ -15,7 +15,7 @@ def run(coro_fn):
     asyncio.run(coro_fn())
 
 
-def test_disconnect_during_inflight_login_leaves_zombie_reconnect(monkeypatch):
+def test_unload_during_inflight_login_does_not_reconnect(monkeypatch):
     """Unload while the reconnect task is inside login(): engineio swallows the
     CancelledError (engineio/async_client.py _trigger_event: `except CancelledError: pass`),
     so the loop survives disconnect() and reconnects to the cloud after unload."""
@@ -42,11 +42,11 @@ def test_disconnect_during_inflight_login_leaves_zombie_reconnect(monkeypatch):
             client._token = make_jwt(time.time() - 10)  # force login on reconnect
             cloud.proxy.drop_all()
             await asyncio.wait_for(started.wait(), 5)  # reconnect is inside login()
+            task = client._reconnect_task
             await client.disconnect()  # HA unload
-            task_after = client._reconnect_task
             gate.set()
-            await asyncio.sleep(2.5)
-            assert task_after is None
+            await asyncio.sleep(1.0)  # 5+ reconnect windows at 0.1-0.2 s
+            assert task is not None and task.done()
             assert not client.connected, "client reconnected after disconnect()"
             assert len(cloud.sids) == 1, f"new cloud sessions after unload: {cloud.sids}"
             # no stray socket.io read loops / proxied conns left behind
@@ -163,18 +163,17 @@ def test_snapshot_request_is_retried_after_reconnect():
                 await wait_for(lambda: client.connected)
                 await asyncio.sleep(0.3)
                 cloud.answer_snapshot = True  # server healthy again, answers any new request
-                await asyncio.sleep(3)
-                assert MAC in client.states, "no snapshot re-request: entities unavailable forever"
+                await wait_for(lambda: MAC in client.states)  # fails: never re-requested
             finally:
                 await client.disconnect()
 
     run(body)
 
 
-def test_partial_control_push_stops_snapshot_poll():
-    """_poll_snapshot loops on `not self.states`. A per-control push (phone app toggles a
-    light) during the lost-snapshot window populates states[MAC] without bassinestConnected,
-    the poll stops, and every entity stays unavailable although the socket is healthy."""
+def test_partial_control_push_keeps_snapshot_poll():
+    """A per-control push (phone app toggles a light) during the lost-snapshot window
+    populates states[MAC] without bassinestConnected; the poll keys on _snapshot_seen, so
+    it keeps asking until a real snapshot arrives."""
 
     async def body():
         async with fake_cloud() as cloud:
@@ -190,11 +189,7 @@ def test_partial_control_push_stops_snapshot_poll():
                 await cloud.sio.emit("NIGHT_LIGHT", {"mac": MAC, "nightLightState": 1})
                 await wait_for(lambda: MAC in client.states)
                 cloud.answer_snapshot = True  # server healthy again
-                await asyncio.sleep(3)
-                assert client.states[MAC].get("bassinestConnected"), (
-                    f"snapshot poll stopped on partial state: {client.states[MAC]}"
-                )
-                assert client._snapshot_task and not client._snapshot_task.done()
+                await wait_for(lambda: client.states[MAC].get("bassinestConnected"))
             finally:
                 await client.disconnect()
 
@@ -222,9 +217,9 @@ def test_disconnect_does_not_reraise_finished_task_exception():
     run(body)
 
 
-def test_disconnect_swallows_its_own_cancellation(monkeypatch):
-    """`with suppress(CancelledError): await task` also eats a cancel of the task running
-    disconnect() (HA shutdown / unload timeout): the unloader looks finished, not cancelled."""
+def test_disconnect_propagates_its_own_cancellation(monkeypatch):
+    """A cancel of the task running disconnect() (HA shutdown / unload timeout) must
+    propagate, not be swallowed with the reconnect task's own cancellation."""
     monkeypatch.setattr(api, "RECONNECT_DELAY", 5)
     monkeypatch.setattr(api, "RECONNECT_MAX", 5)
 
@@ -246,9 +241,9 @@ def test_disconnect_swallows_its_own_cancellation(monkeypatch):
     run(body)
 
 
-def test_fresh_outage_after_short_hold_pays_previous_backoff(monkeypatch):
-    """_delay must reset once the previous connection held > HOLD_RESET. After one kick
-    episode a genuine drop of a connection that held 0.6*MAX waits the full MAX."""
+def test_fresh_outage_resets_backoff(monkeypatch):
+    """_delay resets once the previous connection held > HOLD_RESET: after a kick episode
+    escalated it, a genuine drop of a connection that held starts from RECONNECT_DELAY."""
     monkeypatch.setattr(api, "RECONNECT_DELAY", 0.1)
     monkeypatch.setattr(api, "RECONNECT_MAX", 1.0)
     monkeypatch.setattr(api, "HOLD_RESET", 0.5)
@@ -267,6 +262,14 @@ def test_fresh_outage_after_short_hold_pays_previous_backoff(monkeypatch):
             asyncio.get_running_loop().create_task(kick())
 
     monkeypatch.setattr(FakeCloud, "_connect", kicking_connect)
+    first_delays: list[float] = []  # delay each reconnect episode starts with
+    orig_reconnect = api.HaloClient._reconnect
+
+    async def spy(self):
+        first_delays.append(self._delay)
+        await orig_reconnect(self)
+
+    monkeypatch.setattr(api.HaloClient, "_reconnect", spy)
 
     async def body():
         async with fake_cloud() as cloud:
@@ -275,12 +278,11 @@ def test_fresh_outage_after_short_hold_pays_previous_backoff(monkeypatch):
                 await cloud.kick()
                 await wait_for(lambda: client.connected and kicks["n"] == 0, 10)
                 await asyncio.sleep(0.6)  # held 0.6 * MAX: a real connection, not a kick loop
-                t0 = time.monotonic()
+                assert max(first_delays) > api.RECONNECT_DELAY, first_delays  # kicks escalated
                 cloud.proxy.drop_all()  # genuine network blip, server fine
                 await wait_for(lambda: not client.connected)
                 await wait_for(lambda: client.connected and MAC in client.states, 10)
-                took = time.monotonic() - t0
-                assert took < 0.5, f"fresh outage waited {took:.2f}s (previous episode's backoff)"
+                assert first_delays[-1] == api.RECONNECT_DELAY, first_delays
             finally:
                 await client.disconnect()
 
