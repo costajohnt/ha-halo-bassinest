@@ -373,15 +373,22 @@ class HaloClient:
             except BaseException:
                 # Finish the rollback before releasing the lock, even if cancelled again.
                 rollback = asyncio.ensure_future(self._stop(mac))
-                try:
-                    await asyncio.shield(rollback)
-                except asyncio.CancelledError:
-                    with suppress(Exception):
-                        await rollback
-                    raise
-                except Exception:  # noqa: BLE001
-                    pass
+                cancelled = False
+                while not rollback.done():
+                    try:
+                        await asyncio.shield(rollback)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                    except Exception:  # noqa: BLE001
+                        pass  # deadline stays set; the backstop retries the stop
+                if cancelled:
+                    raise asyncio.CancelledError from None
                 raise
+
+    def motion_running(self, mac: str) -> bool:
+        """Any rocking or vibration, any level, from any source (app, AutoSoothe, HA)."""
+        state = self.states.get(mac, {})
+        return bool(state.get("motionState") or state.get("vibrationState"))
 
     def _soothe_lock(self, mac: str) -> asyncio.Lock:
         return self._soothe_locks.setdefault(mac, asyncio.Lock())

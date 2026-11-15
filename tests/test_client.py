@@ -338,7 +338,8 @@ def test_backstop_stops_when_state_unconfirmed(monkeypatch):  # fail closed
     async def body():
         client, sent = _capturing_client()
         await client.soothe(MAC, True)
-        client.states[MAC] = {"bassinest_id": MAC}  # keys missing, no fresh snapshot
+        client.states[MAC] = {"bassinest_id": MAC}  # keys missing
+        client._snapshot_seen = True  # even with a fresh snapshot, missing keys fail closed
         sent.clear()
         await wait_for(lambda: MAC not in api._backstop_deadlines)
         assert [e for e, _ in sent] == ["MOTION", "VIBRATION"]
@@ -399,6 +400,8 @@ def test_double_cancel_still_finishes_rollback():  # round-3 review
         task.cancel()
         await asyncio.sleep(0.01)
         task.cancel()  # second cancel lands while the rollback is mid-stop
+        await asyncio.sleep(0.01)
+        task.cancel()  # and a third
         await asyncio.sleep(0.01)
         assert not task.done() and client._soothe_lock(MAC).locked()
         gate.set()
@@ -481,3 +484,13 @@ def test_malformed_snapshot_keeps_polling():  # audit 2026-11-14 L2
     client._snapshot_seen = False
     asyncio.run(handler([]))
     assert client._snapshot_seen is True
+
+
+def test_motion_running_blocks_retrigger_at_any_level():  # switch guard input
+    client, _ = _capturing_client()
+    client.states[MAC] = {"motionState": 1, "motion": 3}  # app rocking at level 3
+    assert client.motion_running(MAC)
+    client.states[MAC] = {"vibrationState": 1}  # half on
+    assert client.motion_running(MAC)
+    client.states[MAC] = {"motionState": 0, "vibrationState": 0}
+    assert not client.motion_running(MAC)

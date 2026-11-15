@@ -67,8 +67,7 @@ class HaloSoothe(HaloEntity, SwitchEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         # Never restart the 2 h window: skip if any motion is running (any level, even
         # half on) or a start is in flight. Completing a pair takes an explicit off, then on.
-        s = self.state_data
-        if self._starting or s.get("motionState") or s.get("vibrationState"):
+        if self._starting or self.client.motion_running(self.mac):
             return
         self._starting = True
         try:
