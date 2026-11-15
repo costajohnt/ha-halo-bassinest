@@ -51,7 +51,7 @@ logger:
     custom_components.halo_bassinest: debug
 ```
 
-Remove email addresses and MAC addresses before posting logs in an issue.
+Remove email addresses and MAC addresses before posting logs in an issue. For a state dump, use Download diagnostics on the integration's menu: emails, MACs, ids and names are redacted.
 
 ## Removal
 
@@ -64,7 +64,9 @@ pip install aiohttp "python-socketio[asyncio_client]==5.17.1" pytest
 pytest -q
 ```
 
-Runs the client against a local fake HALO server (login, token expiry, socket auth, payload format, state merge).
+Home Assistant layer tests (config flow, setup, entities, diagnostics) need `pip install pytest-homeassistant-custom-component==0.13.316` and run with `pytest -q tests/ha`.
+
+The client tests run against a local fake HALO server (login, token expiry, socket auth, payload format, state merge).
 
 ## License
 

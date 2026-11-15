@@ -23,6 +23,9 @@ proxy (`tests/conftest.py`): error classification, state clearing on disconnect,
 reconnect after drops and server kicks, backoff, reauth stop, malformed pushes;
 `tests/test_reconnect_edge_cases.py` covers unload mid-reconnect, kick loops and
 lost snapshots.
+`tests/ha/` tests the HA layer (config flow, setup error mapping, entities, Soothe
+guard, diagnostics redaction) with a fake client; needs
+`pip install pytest-homeassistant-custom-component==0.13.316` and skips without it.
 `tests/test_api.py` checks the wire format (also runnable as
 `python tests/test_api.py`). `.github/workflows/ci.yml` runs the same. Never point
 tests at the real cloud or a real bassinet.
