@@ -61,17 +61,13 @@ class HaloTone(HaloEntity, SelectEntity):
 
 class HaloPresetChoice(HaloEntity, SelectEntity):
     @property
-    def _presets(self) -> dict[str, str]:
-        return self.client.presets.get(self.mac, {})
-
-    @property
     def options(self) -> list[str]:
-        return list(self._presets.values())
+        return self.client.presets.get(self.mac, [])
 
     @property
     def current_option(self) -> str | None:
-        return self._presets.get(str(self.state_data.get("soothingPresetId")))
+        current = self.state_data.get("soothingPresetId")
+        return current if current in self.options else None
 
     async def async_select_option(self, option: str) -> None:
-        preset_id = next(k for k, v in self._presets.items() if v == option)
-        await self._send(self.client.set_preset(self.mac, preset_id=preset_id))
+        await self._send(self.client.set_preset(self.mac, preset_id=option))

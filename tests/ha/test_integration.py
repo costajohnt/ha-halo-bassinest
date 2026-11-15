@@ -208,10 +208,10 @@ async def test_every_control_through_services(hass: HomeAssistant) -> None:
     entry = await _setup(hass)
     ids = {k.removeprefix(f"{MAC}_"): v.entity_id for k, v in _ids(hass, entry).items()}
     client = FakeClient.last
-    client.push({**SNAPSHOT, "motion": 1, "motionState": 0, "soothingPresetId": "1",
+    client.push({**SNAPSHOT, "motion": 1, "motionState": 0, "soothingPresetId": "0-3 weeks",
                  "sensitivity": 2, "volume": 1, "sound": 1})
     await hass.async_block_till_done()
-    assert hass.states.get(ids["preset"]).state == "Calm"
+    assert hass.states.get(ids["preset"]).state == "0-3 weeks"
     assert hass.states.get(ids["rocking_level"]).state == "Low"
 
     async def call(domain, service, key, **data):
@@ -238,8 +238,8 @@ async def test_every_control_through_services(hass: HomeAssistant) -> None:
     assert e == "SOOTHING_PRESET" and d["soothingPresetAutoModeState"] == 1
     e, d = await call("number", "set_value", "sensitivity", value=4)
     assert e == "SOOTHING_PRESET" and d["sensitivity"] == 4
-    e, d = await call("select", "select_option", "preset", option="Mine")
-    assert e == "SOOTHING_PRESET" and d["soothingPresetId"] == "9"
+    e, d = await call("select", "select_option", "preset", option="newborn")
+    assert e == "SOOTHING_PRESET" and d["soothingPresetId"] == "newborn"
     e, d = await call("switch", "turn_on", "soothing_preset")
     assert e == "SOOTHING_PRESET" and d["soothingPresetState"] == 1
     assert await hass.config_entries.async_unload(entry.entry_id)

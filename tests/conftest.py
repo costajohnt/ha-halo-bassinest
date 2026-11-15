@@ -84,6 +84,7 @@ class FakeCloud:
     def __init__(self) -> None:
         self.login_status = 200
         self.answer_snapshot = True
+        self.echo = True  # the real cloud does not echo a command to its sender
         self.snapshot_items: list[dict] = [
             {"bassinest_id": MAC, "bassinestConnected": 1, "nightLightState": 1}
         ]
@@ -111,10 +112,11 @@ class FakeCloud:
         return web.json_response(
             {
                 "allPresets": [
-                    {"id": 1, "soothingPresetName": "Calm"},
-                    {"id": 9, "soothingPresetName": "Calm"},
+                    {"id": 1, "soothingPresetName": "0-3 weeks"},
+                    {"id": 2, "soothingPresetName": "newborn"},
+                    {"id": 9, "soothingPresetName": "newborn"},
                 ],
-                "presetAssociatedWithMac": {"soothingPresetId": "1"},
+                "presetAssociatedWithMac": {"soothingPresetId": "0-3 weeks"},
             }
         )
 
@@ -130,7 +132,16 @@ class FakeCloud:
 
     async def _echo(self, event: str, sid: str, data: str) -> None:
         self.received.append((event, data))
-        await self.sio.emit(event, json.loads(data)["data"], to=sid)
+        payload = json.loads(data)["data"]
+        for item in self.snapshot_items:  # the cloud applies it to the device state
+            if item["bassinest_id"] == payload.get("mac"):
+                item.update(
+                    {k: v for k, v in payload.items()
+                     if k not in ("mac", "bassinestId", "device_id", "eventId")}
+                )
+        if self.echo:
+            await self.sio.emit(event, payload, to=sid)
+        return {"status": "ok"}  # delivered only if the client asked for an ack
 
     async def kick(self) -> None:
         await self.sio.disconnect(self.sids[-1])

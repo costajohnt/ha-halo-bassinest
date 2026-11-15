@@ -90,8 +90,8 @@ class HaloSoothe(HaloEntity, SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        # On only at the soothe level: rocking at High shows on the Rocking switch.
-        return self._active("motion") or self._active("vibration")
+        # What Soothe starts: both at the low level. Plain Rocking on Low is not Soothe.
+        return self._active("motion") and self._active("vibration")
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         # Never restart the 2 h window: skip if any motion is running (any level, even

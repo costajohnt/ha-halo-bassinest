@@ -257,7 +257,7 @@ def test_control_values_outside_app_range_are_refused(event, kwargs):
 
 def test_global_timer_and_preset_payloads():
     client, sent = _capturing_client()
-    client.states[MAC].update(soothingPresetId="12", sensitivity=3)
+    client.states[MAC].update(soothingPresetId="0-3 weeks", sensitivity=3)
     asyncio.run(client.set_global_timer(MAC, 60))
     e, d = sent[-1]
     assert e == "GLOBAL_RUNTIME" and (d["globalTimerState"], d["globalRuntimeTimer"]) == (1, 60)
@@ -266,10 +266,10 @@ def test_global_timer_and_preset_payloads():
     e, d = sent[-1]
     assert e == "SOOTHING_PRESET" and "bassinestId" not in d
     assert (d["soothingPresetAutoModeState"], d["previousSoothingPresetAutoModeState"]) == (1, 0)
-    assert d["soothingPresetId"] == "12" and d["sensitivity"] == 3  # current kept
-    asyncio.run(client.set_preset(MAC, preset_id="7", on=True, sensitivity=4))
+    assert d["soothingPresetId"] == "0-3 weeks" and d["sensitivity"] == 3  # current kept
+    asyncio.run(client.set_preset(MAC, preset_id="newborn", on=True, sensitivity=4))
     d = sent[-1][1]
-    assert (d["soothingPresetId"], d["soothingPresetState"], d["sensitivity"]) == ("7", 1, 4)
+    assert (d["soothingPresetId"], d["soothingPresetState"], d["sensitivity"]) == ("newborn", 1, 4)
     with pytest.raises(ValueError):
         asyncio.run(client.set_preset(MAC, sensitivity=5))
     with pytest.raises(ValueError):
@@ -280,8 +280,8 @@ def test_fetch_presets_and_default():
     async def body():
         async with fake_cloud() as cloud:
             client = api.HaloClient(cloud.session, "a@b.c", "pw", "ha-test")
-            # a custom preset named like a built-in one stays selectable
-            assert await client.fetch_presets(MAC) == {"1": "Calm", "9": "Calm (9)"}
+            # names, de-duplicated: the cloud identifies presets by name
+            assert await client.fetch_presets(MAC) == ["0-3 weeks", "newborn"]
             client.bassinets = {MAC: {"id": 7}}
             sent: list[dict] = []
 
@@ -290,7 +290,7 @@ def test_fetch_presets_and_default():
 
             client._emit = capture  # type: ignore[method-assign]
             await client.set_preset(MAC, on=True)  # no id in state: bassinet's own preset
-            assert sent[-1]["soothingPresetId"] == "1"
+            assert sent[-1]["soothingPresetId"] == "0-3 weeks"
 
     run(body)
 
@@ -621,3 +621,51 @@ def test_motion_running_blocks_retrigger_at_any_level():  # switch guard input
     assert client.motion_running(MAC)
     client.states[MAC] = {"motionState": 0, "vibrationState": 0}
     assert not client.motion_running(MAC)
+
+
+def test_state_follows_commands_without_echo():  # live 2026-11-15: no echo to sender
+    async def body():
+        async with fake_cloud() as cloud:
+            cloud.echo = False
+            client = await connected_client(cloud)
+            try:
+                await client.set_control(MAC, "FLOOR_LIGHT", True, brightness=75)
+                await wait_for(lambda: client.states[MAC].get("floorLightState") == 1)
+                assert client.states[MAC]["floorLightBrightness"] == 75
+            finally:
+                await client.disconnect()
+
+    run(body)
+
+
+def test_periodic_refresh_sees_device_side_changes(monkeypatch):  # timer ends unpushed
+    monkeypatch.setattr(api, "STATE_REFRESH", 0.2)
+
+    async def body():
+        async with fake_cloud() as cloud:
+            client = await connected_client(cloud)
+            try:
+                assert client.states[MAC]["nightLightState"] == 1
+                cloud.snapshot_items[0]["nightLightState"] = 0  # its timer ran out
+                await wait_for(lambda: client.states[MAC]["nightLightState"] == 0)
+            finally:
+                await client.disconnect()
+
+    run(body)
+
+
+def test_every_command_requests_an_ack():  # live 2026-11-15: cloud drops unacked sockets
+    async def body():
+        async with fake_cloud() as cloud:
+            client = await connected_client(cloud)
+            acks: list[tuple] = []
+            client._on_ack = lambda *reply: acks.append(reply)  # type: ignore[method-assign]
+            try:
+                await client.set_global_timer(MAC, 5)
+                await client.turn_everything_off(MAC)
+                await wait_for(lambda: len(acks) == 2)
+                assert acks[0] == ({"status": "ok"},)
+            finally:
+                await client.disconnect()
+
+    run(body)

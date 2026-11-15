@@ -26,6 +26,11 @@ RECONNECT_DELAY = 1  # seconds, doubles each attempt
 RECONNECT_MAX = 60
 HOLD_RESET = 10  # a connection that held this long resets the backoff: outage, not a kick loop
 SNAPSHOT_RETRY = 2  # seconds, doubles; re-asks for the snapshot while no state has arrived
+# The cloud does not echo a command to the client that sent it, and does not push when a
+# bassinet timer ends (verified live 2026-11-15), so state is re-read after every command
+# and on a fixed interval.
+STATE_REFRESH = 60  # seconds
+REFRESH_AFTER_COMMAND = 1.0  # seconds, lets the cloud apply the command first
 
 # Per-control events the server pushes back as flat objects keyed by "mac".
 CONTROL_EVENTS = (
@@ -112,9 +117,12 @@ class HaloClient:
         self._snapshot_seen = False
         self._token_dropped = False  # once per outage, see _reconnect
         self._backstops: dict[str, asyncio.Task[None]] = {}
-        self.presets: dict[str, dict[str, str]] = {}  # mac -> preset id -> name
+        # mac -> preset names. The cloud identifies presets by name: soothingPresetId in
+        # state and in SOOTHING_PRESET is the name (seen live 2026-11-15), not the REST id.
+        self.presets: dict[str, list[str]] = {}
         self._default_preset: dict[str, str] = {}  # mac -> preset tied to the bassinet
         self._sent: dict[str, dict[str, Any]] = {}  # mac -> fields sent, not yet echoed
+        self._refresh_now = asyncio.Event()
         # Serialises start, stop and the backstop per bassinet, so a stop can't land in
         # the middle of a start or clear a deadline a newer start just set.
         self._soothe_locks: dict[str, asyncio.Lock] = {}
@@ -235,12 +243,24 @@ class HaloClient:
             self._token = None
 
     async def _poll_snapshot(self) -> None:
+        """Ask for the full snapshot: with backoff until one arrives, then every
+        STATE_REFRESH seconds, and shortly after each command we send."""
         delay: float = SNAPSHOT_RETRY
-        while self.connected and not self._snapshot_seen:
+        while self.connected:
             with suppress(socketio.exceptions.BadNamespaceError):
                 await self._sio.emit("DEVICE_SETTINGS_AND_STATES")
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, RECONNECT_MAX)
+            self._refresh_now.clear()
+            wait = STATE_REFRESH if self._snapshot_seen else delay
+            try:
+                await asyncio.wait_for(self._refresh_now.wait(), wait)
+                await asyncio.sleep(REFRESH_AFTER_COMMAND)
+            except TimeoutError:
+                if not self._snapshot_seen:
+                    delay = min(delay * 2, RECONNECT_MAX)
+
+    def refresh_soon(self) -> None:
+        """Re-read state shortly: our own commands are not echoed back to us."""
+        self._refresh_now.set()
 
     def add_listener(self, cb: Callable[[], None]) -> Callable[[], None]:
         self._listeners.append(cb)
@@ -333,6 +353,9 @@ class HaloClient:
             with suppress(socketio.exceptions.BadNamespaceError):
                 await self._sio.emit("DEVICE_SETTINGS_AND_STATES")
 
+    def _on_ack(self, *reply: Any) -> None:
+        _LOGGER.debug("HALO ack %r", reply)
+
     def _confirmed(self, mac: str, item: dict[str, Any]) -> None:
         sent = self._sent.get(mac)
         if sent:
@@ -345,7 +368,12 @@ class HaloClient:
         data = {"eventId": int(time.time() * 1000), **data}
         # The app sends the payload as a JSON *string*, not an object.
         try:
-            await self._sio.emit(event, json.dumps({"action": event, "data": data}))
+            # Always ask for an ack, like the app. Some cloud handlers reply
+            # unconditionally; without an ack request the cloud drops the socket
+            # (seen live 2026-11-15 on GLOBAL_RUNTIME, Soothe off and preset stop).
+            await self._sio.emit(
+                event, json.dumps({"action": event, "data": data}), callback=self._on_ack
+            )
         except socketio.exceptions.SocketIOError as err:  # dropped between check and send
             raise ConnectionError(f"HALO cloud not connected ({err})") from err
 
@@ -411,6 +439,7 @@ class HaloClient:
         fields from stale state and could undo the first (e.g. restart a stopped rocker).
         """
         await self._emit(event, data)
+        self.refresh_soon()
         skip = {"mac", "bassinestId", "device_id", "eventId"}
         self._sent.setdefault(data["mac"], {}).update(
             {k: v for k, v in data.items() if k not in skip and not k.startswith("previous")}
@@ -481,8 +510,8 @@ class HaloClient:
             },
         )
 
-    async def fetch_presets(self, mac: str) -> dict[str, str]:
-        """Preset id -> name for one bassinet (built-in and the account's own)."""
+    async def fetch_presets(self, mac: str) -> list[str]:
+        """Preset names for one bassinet (built-in and the account's own)."""
         token = await self._valid_token()
         async with self._session.get(
             f"{REST_URL}/api/soothingPresetInfo/{mac}",
@@ -491,12 +520,13 @@ class HaloClient:
         ) as resp:
             resp.raise_for_status()
             body = await resp.json(content_type=None)
-        names: dict[str, str] = {}
-        for p in body.get("allPresets") or []:
-            name = str(p.get("soothingPresetName") or p["id"])
-            if name in names.values():  # a custom preset named like a built-in one
-                name = f"{name} ({p['id']})"
-            names[str(p["id"])] = name
+        names = list(
+            dict.fromkeys(  # same-named presets are one preset to the cloud
+                str(p["soothingPresetName"])
+                for p in body.get("allPresets") or []
+                if p.get("soothingPresetName")
+            )
+        )
         self.presets[mac] = names
         assoc = (body.get("presetAssociatedWithMac") or {}).get("soothingPresetId")
         if assoc:
@@ -596,6 +626,7 @@ class HaloClient:
 
     async def turn_everything_off(self, mac: str) -> None:
         await self._emit("TURN_EVERYTHING_OFF", {"turnEveryThingOff": True, "mac": mac})
+        self.refresh_soon()
 
 
 def _loads(value: Any) -> Any:
