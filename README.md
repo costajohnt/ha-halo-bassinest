@@ -17,7 +17,7 @@ Everything the HALO app can control:
 | Sound timer | number | 1-600 minutes, 0 = no timer |
 | Night light, Floor light, Back light | light | brightness 25/50/75/100% |
 | Night/Floor/Back light timer | number | 1-600 minutes, 0 = no timer |
-| Master timer | number | 1-120 minutes for the whole bassinet, 0 = off |
+| Master timer | number | 1-120 minutes for the whole bassinet, 0 = off. In a live test, setting it stopped rocking within seconds instead of counting down; behaviour not fully understood |
 | AutoSoothe | switch | respond to crying with the selected preset |
 | Cry sensitivity | number | 1-4, while AutoSoothe is on (as in the app) |
 | Preset | select | the account's soothing presets (built-in and your own) |
