@@ -38,7 +38,7 @@ Cry events are not exposed: the app only gets them as push notifications, not ov
 
 ## Install
 
-HACS: HACS > Integrations > three-dot menu > Custom repositories, add `https://github.com/costajohnt/ha-halo-bassinest` as an Integration, install HALO BassiNest, restart HA.
+HACS: search for "HALO BassiNest" in HACS, download it, restart Home Assistant. (It is in the default HACS store; no custom repository needed.)
 
 Manual: copy `custom_components/halo_bassinest` into your HA `config/custom_components/`, restart, then Settings > Devices & services > Add integration > HALO BassiNest.
 
